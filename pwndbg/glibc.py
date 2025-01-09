@@ -7,35 +7,43 @@ from __future__ import annotations
 import functools
 import os
 import re
+from typing import Callable
+from typing import List
+from typing import Tuple
+from typing import TypeVar
+from typing import Union
+from typing import cast
 
-import gdb
 from elftools.elf.relocation import Relocation
+from typing_extensions import ParamSpec
 
-import pwndbg.gdblib.config
-import pwndbg.gdblib.elf
-import pwndbg.gdblib.file
-import pwndbg.gdblib.info
-import pwndbg.gdblib.memory
-import pwndbg.gdblib.proc
-import pwndbg.gdblib.symbol
-import pwndbg.heap
+import pwndbg.aglib.elf
+import pwndbg.aglib.file
+import pwndbg.aglib.heap
+import pwndbg.aglib.memory
+import pwndbg.aglib.proc
+import pwndbg.aglib.symbol
 import pwndbg.lib.cache
+import pwndbg.lib.config
 import pwndbg.search
 from pwndbg.color import message
 
-safe_lnk = pwndbg.gdblib.config.add_param(
+P = ParamSpec("P")
+T = TypeVar("T")
+
+safe_lnk = pwndbg.config.add_param(
     "safe-linking",
     None,
     "whether glibc use safe-linking (on/off/auto)",
-    param_class=gdb.PARAM_AUTO_BOOLEAN,
+    param_class=pwndbg.lib.config.PARAM_AUTO_BOOLEAN,
 )
 
-glibc_version = pwndbg.gdblib.config.add_param(
+glibc_version = pwndbg.config.add_param(
     "glibc", "", "GLIBC version for heap heuristics resolution (e.g. 2.31)", scope="heap"
 )
 
 
-@pwndbg.gdblib.config.trigger(glibc_version)
+@pwndbg.config.trigger(glibc_version)
 def set_glibc_version() -> None:
     ret = re.search(r"(\d+)\.(\d+)", glibc_version.value)
     if ret:
@@ -50,24 +58,28 @@ def set_glibc_version() -> None:
     glibc_version.revert_default()
 
 
-@pwndbg.gdblib.proc.OnlyWhenRunning
-def get_version() -> tuple[int, ...] | None:
-    return glibc_version or _get_version()
+@pwndbg.aglib.proc.OnlyWhenRunning
+def get_version() -> Tuple[int, ...] | None:
+    return cast(Union[Tuple[int, ...], None], glibc_version) or _get_version()
 
 
-@pwndbg.gdblib.proc.OnlyWhenRunning
+@pwndbg.aglib.proc.OnlyWhenRunning
 @pwndbg.lib.cache.cache_until("start", "objfile")
-def _get_version() -> tuple[int, ...] | None:
-    if pwndbg.heap.current.libc_has_debug_syms():
-        addr = pwndbg.gdblib.symbol.address("__libc_version")
+def _get_version() -> Tuple[int, ...] | None:
+    from pwndbg.aglib.heap.ptmalloc import GlibcMemoryAllocator
+
+    assert isinstance(pwndbg.aglib.heap.current, GlibcMemoryAllocator)
+    if pwndbg.aglib.heap.current.libc_has_debug_syms():
+        addr = pwndbg.aglib.symbol.lookup_symbol_addr("__libc_version")
         if addr is not None:
-            ver = pwndbg.gdblib.memory.string(addr)
+            ver = pwndbg.aglib.memory.string(addr)
             return tuple(int(_) for _ in ver.split(b"."))
+
     libc_filename = get_libc_filename_from_info_sharedlibrary()
     if not libc_filename:
         return None
-    result = pwndbg.gdblib.elf.dump_section_by_name(libc_filename, ".rodata", try_local_path=True)
-    if not result:
+    result = pwndbg.aglib.elf.dump_section_by_name(libc_filename, ".rodata", try_local_path=True)
+    if result is None:
         return None
     _, _, data = result
     banner_start = data.find(b"GNU C Library")
@@ -78,14 +90,26 @@ def _get_version() -> tuple[int, ...] | None:
     return tuple(int(_) for _ in ret.groups()) if ret else None
 
 
-@pwndbg.gdblib.proc.OnlyWhenRunning
+@pwndbg.aglib.proc.OnlyWhenRunning
 @pwndbg.lib.cache.cache_until("start", "objfile")
 def get_libc_filename_from_info_sharedlibrary() -> str | None:
     """
     Get the filename of the libc by parsing the output of `info sharedlibrary`.
     """
-    possible_libc_path = []
-    for path in pwndbg.gdblib.info.sharedlibrary_paths():
+    possible_libc_path: List[str] = []
+    i = pwndbg.dbg.selected_inferior()
+
+    main_module_name = i.main_module_name()
+    seen = set()
+    for address, size, sect_name, module_name in i.module_section_locations():
+        if module_name in seen:
+            continue
+        seen.add(module_name)
+
+        if module_name == main_module_name:
+            continue
+
+        path = module_name
         basename = os.path.basename(
             path[7:] if path.startswith("target:") else path
         )  # "target:" prefix is for remote debugging
@@ -105,9 +129,9 @@ def get_libc_filename_from_info_sharedlibrary() -> str | None:
     return None
 
 
-@pwndbg.gdblib.proc.OnlyWhenRunning
+@pwndbg.aglib.proc.OnlyWhenRunning
 @pwndbg.lib.cache.cache_until("start", "objfile")
-def dump_elf_data_section() -> tuple[int, int, bytes] | None:
+def dump_elf_data_section() -> Tuple[int, int, bytes] | None:
     """
     Dump .data section of libc ELF file
     """
@@ -115,12 +139,12 @@ def dump_elf_data_section() -> tuple[int, int, bytes] | None:
     if not libc_filename:
         # libc not loaded yet, or it's static linked
         return None
-    return pwndbg.gdblib.elf.dump_section_by_name(libc_filename, ".data", try_local_path=True)
+    return pwndbg.aglib.elf.dump_section_by_name(libc_filename, ".data", try_local_path=True)
 
 
-@pwndbg.gdblib.proc.OnlyWhenRunning
+@pwndbg.aglib.proc.OnlyWhenRunning
 @pwndbg.lib.cache.cache_until("start", "objfile")
-def dump_relocations_by_section_name(section_name: str) -> tuple[Relocation, ...] | None:
+def dump_relocations_by_section_name(section_name: str) -> Tuple[Relocation, ...] | None:
     """
     Dump relocations of a section by section name of libc ELF file
     """
@@ -128,63 +152,50 @@ def dump_relocations_by_section_name(section_name: str) -> tuple[Relocation, ...
     if not libc_filename:
         # libc not loaded yet, or it's static linked
         return None
-    return pwndbg.gdblib.elf.dump_relocations_by_section_name(
+    return pwndbg.aglib.elf.dump_relocations_by_section_name(
         libc_filename, section_name, try_local_path=True
     )
 
 
-@pwndbg.gdblib.proc.OnlyWhenRunning
+@pwndbg.aglib.proc.OnlyWhenRunning
 @pwndbg.lib.cache.cache_until("start", "objfile")
-def get_data_section_address() -> int:
+def get_section_address_by_name(section_name: str) -> int:
     """
-    Find .data section address of libc
+    Find section address of libc by section name
     """
     libc_filename = get_libc_filename_from_info_sharedlibrary()
     if not libc_filename:
         # libc not loaded yet, or it's static linked
         return 0
     # TODO: If we are debugging a remote process, this might not work if GDB cannot load the so file
-    out = pwndbg.gdblib.info.files()
-    for line in out.splitlines():
-        if line.endswith(" is .data in " + libc_filename):
-            return int(line.split()[0], 16)
+    for (
+        address,
+        size,
+        candidate_section_name,
+        module_name,
+    ) in pwndbg.dbg.selected_inferior().module_section_locations():
+        if section_name == candidate_section_name and module_name == libc_filename:
+            return address
     return 0
 
 
-@pwndbg.gdblib.proc.OnlyWhenRunning
-@pwndbg.lib.cache.cache_until("start", "objfile")
-def get_got_section_address() -> int:
-    """
-    Find .got section address of libc
-    """
-    libc_filename = get_libc_filename_from_info_sharedlibrary()
-    if not libc_filename:
-        # libc not loaded yet, or it's static linked
-        return 0
-    # TODO: If we are debugging a remote process, this might not work if GDB cannot load the so file
-    out = pwndbg.gdblib.info.files()
-    for line in out.splitlines():
-        if line.endswith(" is .got in " + libc_filename):
-            return int(line.split()[0], 16)
-    return 0
-
-
-def OnlyWhenGlibcLoaded(function):
+def OnlyWhenGlibcLoaded(function: Callable[P, T]) -> Callable[P, T | None]:
     @functools.wraps(function)
-    def _OnlyWhenGlibcLoaded(*a, **kw):
+    def _OnlyWhenGlibcLoaded(*a: P.args, **kw: P.kwargs) -> T | None:
         if get_version() is not None:
             return function(*a, **kw)
-        else:
-            print(f"{function.__name__}: GLibc not loaded yet.")
+
+        print(f"{function.__name__}: GLibc not loaded yet.")
+        return None
 
     return _OnlyWhenGlibcLoaded
 
 
 @OnlyWhenGlibcLoaded
-def check_safe_linking():
+def check_safe_linking() -> bool:
     """
     Safe-linking is a glibc 2.32 mitigation; see:
     - https://lanph3re.blogspot.com/2020/08/blog-post.html
     - https://research.checkpoint.com/2020/safe-linking-eliminating-a-20-year-old-malloc-exploit-primitive/
     """
-    return (get_version() >= (2, 32) or safe_lnk) and safe_lnk is not False
+    return (get_version() >= (2, 32) or safe_lnk.value) and safe_lnk.value is not False

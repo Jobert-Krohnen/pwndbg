@@ -2,62 +2,73 @@
 Reading register value from the inferior, and provides a
 standardized interface to registers like "sp" and "pc".
 """
+
 from __future__ import annotations
 
-import collections
+from typing import Dict
+from typing import Iterator
+from typing import List
+from typing import OrderedDict
+from typing import Set
+from typing import Tuple
+from typing import Union
+
+BitFlags = OrderedDict[str, Union[int, Tuple[int, int]]]
 
 
 class RegisterSet:
     #: Program counter register
-    pc = None
+    pc: str
 
     #: Stack pointer register
-    stack = None
+    stack: str
 
     #: Frame pointer register
-    frame = None
+    frame: str | None = None
 
     #: Return address register
-    retaddr = None
+    retaddr: Tuple[str, ...]
 
     #: Flags register (eflags, cpsr)
-    flags = None
+    flags: Dict[str, BitFlags]
 
     #: List of native-size general-purpose registers
-    gpr = None
+    gpr: Tuple[str, ...]
 
     #: List of miscellaneous, valid registers
-    misc = None
+    misc: Tuple[str, ...]
 
     #: Register-based arguments for most common ABI
-    regs = None
+    args: Tuple[str, ...]
 
     #: Return value register
-    retval = None
+    retval: str | None
 
     #: Common registers which should be displayed in the register context
-    common: list[str] = None
+    common: List[str] = []
 
     #: All valid registers
-    all = None
+    all: Set[str]
 
     def __init__(
         self,
-        pc="pc",
-        stack="sp",
-        frame=None,
-        retaddr=tuple(),
-        flags={},
-        gpr=tuple(),
-        misc=tuple(),
-        args=tuple(),
-        retval=None,
+        pc: str = "pc",
+        stack: str = "sp",
+        frame: str | None = None,
+        retaddr: Tuple[str, ...] = (),
+        flags: Dict[str, BitFlags] = {},
+        extra_flags: Dict[str, BitFlags] = {},
+        gpr: Tuple[str, ...] = (),
+        misc: Tuple[str, ...] = (),
+        args: Tuple[str, ...] = (),
+        retval: str | None = None,
     ) -> None:
         self.pc = pc
         self.stack = stack
         self.frame = frame
         self.retaddr = retaddr
         self.flags = flags
+        self.extra_flags = extra_flags
         self.gpr = gpr
         self.misc = misc
         self.args = args
@@ -69,14 +80,25 @@ class RegisterSet:
             if reg and reg not in self.common:
                 self.common.append(reg)
 
-        self.all = {i for i in misc} | set(flags) | set(self.retaddr) | set(self.common)
+        # The specific order of this list is very important:
+        # Due to the behavior of Arm in the Unicorn engine,
+        # we must write the flags register after PC, and the stack pointer after the flags register.
+        # Otherwise, the values will be clobbered
+        # https://github.com/pwndbg/pwndbg/pull/2337
+        self.emulated_regs_order: List[str] = []
+
+        for reg in [pc] + list(flags) + [stack, frame] + list(retaddr) + list(misc) + list(gpr):
+            if reg and reg not in self.emulated_regs_order:
+                self.emulated_regs_order.append(reg)
+
+        self.all = set(misc) | set(flags) | set(extra_flags) | set(self.retaddr) | set(self.common)
         self.all -= {None}
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[str]:
         yield from self.all
 
 
-arm_cpsr_flags = collections.OrderedDict(
+arm_cpsr_flags = BitFlags(
     [
         ("N", 31),
         ("Z", 30),
@@ -91,11 +113,9 @@ arm_cpsr_flags = collections.OrderedDict(
         ("F", 6),
     ]
 )
-arm_xpsr_flags = collections.OrderedDict(
-    [("N", 31), ("Z", 30), ("C", 29), ("V", 28), ("Q", 27), ("T", 24)]
-)
+arm_xpsr_flags = BitFlags([("N", 31), ("Z", 30), ("C", 29), ("V", 28), ("Q", 27), ("T", 24)])
 
-aarch64_cpsr_flags = collections.OrderedDict(
+aarch64_cpsr_flags = BitFlags(
     [
         ("N", 31),
         ("Z", 30),
@@ -108,13 +128,72 @@ aarch64_cpsr_flags = collections.OrderedDict(
         ("A", 8),
         ("I", 7),
         ("F", 6),
-        # TODO: EL is two bits
-        ("EL", 2),
+        ("EL", (2, 2)),
         ("SP", 0),
     ]
 )
 
+aarch64_sctlr_flags = BitFlags(
+    [
+        ("TIDCP", 63),
+        ("SPINTMASK", 62),
+        ("NMI", 61),
+        ("EPAN", 57),
+        ("ATA0", 43),
+        ("ATA0", 42),
+        ("TCF", (40, 2)),
+        ("TCF0", (38, 2)),
+        ("ITFSB", 37),
+        ("BT1", 36),
+        ("BT0", 35),
+        ("EnIA", 31),
+        ("EnIB", 30),
+        ("EnDA", 27),
+        ("UCI", 26),
+        ("EE", 25),
+        ("E0E", 24),
+        ("SPAN", 23),
+        ("TSCXT", 20),
+        ("WXN", 19),
+        ("nTWE", 18),
+        ("nTWI", 16),
+        ("UCT", 15),
+        ("DZE", 14),
+        ("EnDB", 13),
+        ("I", 12),
+        ("UMA", 9),
+        ("SED", 8),
+        ("ITD", 7),
+        ("nAA", 6),
+        ("CP15BEN", 5),
+        ("SA0", 4),
+        ("SA", 3),
+        ("C", 2),
+        ("A", 1),
+        ("M", 0),
+    ]
+)
+
+aarch64_scr_flags = BitFlags(
+    [
+        ("HCE", 8),
+        ("SMD", 7),
+        ("EA", 3),
+        ("FIQ", 2),
+        ("IRQ", 1),
+        ("NS", 0),
+    ]
+)
+
 arm = RegisterSet(
+    retaddr=("lr",),
+    flags={"cpsr": arm_cpsr_flags},
+    gpr=("r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12"),
+    args=("r0", "r1", "r2", "r3"),
+    retval="r0",
+)
+
+iwmmxt = RegisterSet(
     retaddr=("lr",),
     flags={"cpsr": arm_cpsr_flags},
     gpr=("r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12"),
@@ -135,6 +214,15 @@ armcm = RegisterSet(
 aarch64 = RegisterSet(
     retaddr=("lr",),
     flags={"cpsr": aarch64_cpsr_flags},
+    extra_flags={
+        "scr_el3": aarch64_scr_flags,
+        "sctlr": aarch64_sctlr_flags,
+        "sctlr_el2": aarch64_sctlr_flags,
+        "sctlr_el3": aarch64_sctlr_flags,
+        "spsr_el1": aarch64_cpsr_flags,
+        "spsr_el2": aarch64_cpsr_flags,
+        "spsr_el3": aarch64_cpsr_flags,
+    },
     # X29 is the frame pointer register (FP) but setting it
     # as frame here messes up the register order to the point
     # it's confusing. Think about improving this if frame
@@ -171,7 +259,6 @@ aarch64 = RegisterSet(
         "x27",
         "x28",
         "x29",
-        "x30",
     ),
     misc=(
         "w0",
@@ -209,7 +296,7 @@ aarch64 = RegisterSet(
 )
 
 x86flags = {
-    "eflags": collections.OrderedDict(
+    "eflags": BitFlags(
         [("CF", 0), ("PF", 2), ("AF", 4), ("ZF", 6), ("SF", 7), ("IF", 9), ("DF", 10), ("OF", 11)]
     )
 }
@@ -318,7 +405,7 @@ i386 = RegisterSet(
 # r31     Used for local variables or "environment pointers"
 powerpc = RegisterSet(
     retaddr=("lr",),
-    flags={"msr": {}, "xer": {}},
+    flags={"msr": BitFlags(), "xer": BitFlags()},
     gpr=(
         "r0",
         "r1",
@@ -389,7 +476,7 @@ sparc = RegisterSet(
     stack="sp",
     frame="fp",
     retaddr=("i7",),
-    flags={"psr": {}},
+    flags={"psr": BitFlags()},
     gpr=(
         "g1",
         "g2",
@@ -499,7 +586,6 @@ riscv = RegisterSet(
     stack="sp",
     retaddr=("ra",),
     gpr=(
-        "ra",
         "gp",
         "tp",
         "t0",
@@ -545,6 +631,7 @@ reg_sets = {
     "mips": mips,
     "sparc": sparc,
     "arm": arm,
+    "iwmmxt": iwmmxt,
     "armcm": armcm,
     "aarch64": aarch64,
     "powerpc": powerpc,

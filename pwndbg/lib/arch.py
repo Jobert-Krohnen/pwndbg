@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import struct
 import sys
-
-from typing_extensions import Literal
+from typing import Literal
 
 FMT_LITTLE_ENDIAN = {1: "B", 2: "<H", 4: "<I", 8: "<Q"}
 FMT_BIG_ENDIAN = {1: "B", 2: ">H", 4: ">I", 8: ">Q"}
@@ -12,7 +11,6 @@ FMT_BIG_ENDIAN = {1: "B", 2: ">H", 4: ">I", 8: ">Q"}
 class Arch:
     def __init__(self, arch_name: str, ptrsize: int, endian: Literal["little", "big"]) -> None:
         self.update(arch_name, ptrsize, endian)
-
         self.native_endian = str(sys.byteorder)
 
     def update(self, arch_name: str, ptrsize: int, endian: Literal["little", "big"]) -> None:
@@ -30,7 +28,7 @@ class Arch:
 
         if self.name == "arm" and self.endian == "big":
             self.qemu = "armeb"
-        elif self.name == "mips" and self.name == "little":
+        elif self.name == "mips" and self.endian == "little":
             self.qemu = "mipsel"
         else:
             self.qemu = self.name

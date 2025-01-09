@@ -5,19 +5,37 @@ import os
 import stat
 from subprocess import CalledProcessError
 from subprocess import check_output
+from typing import Union
 
 import gdb
+from tabulate import tabulate
 
 import pwndbg.commands
 from pwndbg.color import message
+from pwndbg.commands import CommandCategory
+from pwndbg.ui import get_window_size
+
+_NONE = "none"
+_OLDEST = "oldest"
+_NEWEST = "newest"
+_ASK = "ask"
+_OPTIONS = [_NONE, _OLDEST, _NEWEST, _ASK]
+
+pwndbg.config.add_param(
+    "attachp-resolution-method",
+    _ASK,
+    f'how to determine the process to attach when multiple candidates exists ("{_OLDEST}", "{_NEWEST}", "{_NONE}" or "{_ASK}"(default))',
+)
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
-    description="""Attaches to a given pid, process name or device file.
+    description="""Attaches to a given pid, process name, process found with partial argv match or to a device file.
 
 This command wraps the original GDB `attach` command to add the ability
-to debug a process with given name. In such case the process identifier is
-fetched via the `pidof <name>` command.
+to debug a process with a given name or partial name match. In such cases,
+the process identifier is fetched via the `pidof <name>` command first. If no
+matches are found, then it uses the `ps -eo pid,args` command to search for
+partial name matches.
 
 Original GDB attach command help:
     Attach to a process or file outside of GDB.
@@ -33,11 +51,74 @@ Original GDB attach command help:
     to specify the program, and to load its symbol table.""",
 )
 
-parser.add_argument("target", type=str, help="pid, process name or device file to attach to")
+
+parser.add_argument("--no-truncate", action="store_true", help="dont truncate command args")
+parser.add_argument("--retry", action="store_true", help="retry until a target is found")
+parser.add_argument("--user", type=str, default=None, help="username or uid to filter by")
+parser.add_argument(
+    "-a",
+    "--all",
+    action="store_true",
+    help="get pids for all matches (exact and partial cmdline etc)",
+)
+parser.add_argument(
+    "target",
+    type=str,
+    help="pid, process name, part of cmdline to be matched or device file to attach to",
+)
 
 
-@pwndbg.commands.ArgparsedCommand(parser)
-def attachp(target) -> None:
+def find_pids(target, user, all):
+    # Note: we can't use `ps -C <target>` because this does not accept process names with spaces
+    # so target='a b' would actually match process names 'a' and 'b' here
+    # so instead, we will filter by process name or full cmdline later on
+    # if provided, filter by effective username or uid; otherwise, select all processes
+    ps_filter = ["-u", user] if user is not None else ["-e"]
+    ps_cmd = ["ps", "-o", "pid,args"] + ps_filter
+
+    try:
+        ps_output = check_output(ps_cmd, universal_newlines=True)
+    except FileNotFoundError:
+        print(message.error("Error: did not find `ps` command"))
+        return
+    except CalledProcessError:
+        print(message.error(f"The `{' '.join(ps_cmd)}` command returned non-zero status"))
+        return
+
+    pids_exact_match_cmd = []
+    pids_partial_match_cmd = []
+    pids_partial_match_args = []
+
+    # Skip header line
+    for line in ps_output.strip().splitlines()[1:]:
+        process_info = line.split(maxsplit=1)
+
+        if len(process_info) <= 1:
+            # No command name?
+            continue
+
+        pid, args = process_info
+        cmd = args.split(maxsplit=1)[0]
+
+        # Cannot attach to gdb itself.
+        if int(pid) == os.getpid():
+            continue
+
+        if target == cmd:
+            pids_exact_match_cmd.append(pid)
+        elif target in cmd:
+            pids_partial_match_cmd.append(pid)
+        elif target in args:
+            pids_partial_match_args.append(pid)
+
+    if all:
+        return pids_exact_match_cmd + pids_partial_match_cmd + pids_partial_match_args
+
+    return pids_exact_match_cmd or pids_partial_match_cmd or pids_partial_match_args
+
+
+@pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.START)
+def attachp(target, no_truncate, retry, all, user=None) -> None:
     try:
         resolved_target = int(target)
     except ValueError:
@@ -57,29 +138,128 @@ def attachp(target) -> None:
             resolved_target = target
 
         else:
-            try:
-                pids = check_output(["pidof", target]).decode().rstrip("\n").split(" ")
-            except FileNotFoundError:
-                print(message.error("Error: did not find `pidof` command"))
-                return
-            except CalledProcessError:
-                pids = []
+            pids = find_pids(target, user, all)
+            if not pids and retry:
+                user_filter = "" if not user else f" and user={user}"
+                print(
+                    message.warn(
+                        f"Looking for pids for target={target}{user_filter} in a loop. Hit CTRL+C to cancel"
+                    )
+                )
+                while not pids:
+                    pids = find_pids(target, user, all)
 
             if not pids:
                 print(message.error(f"Process {target} not found"))
                 return
 
             if len(pids) > 1:
-                print(message.warn(f"Found pids: {', '.join(pids)} (use `attach <pid>`)"))
-                return
+                method = pwndbg.config.attachp_resolution_method
 
-            resolved_target = int(pids[0])
+                if method not in _OPTIONS:
+                    print(
+                        message.warn(
+                            f'Invalid value for `attachp-resolution-method` config. Fallback to default value("{_ASK}").'
+                        )
+                    )
+                    method = _ASK
+
+                try:
+                    ps_output = check_output(
+                        [
+                            "ps",
+                            "--no-headers",
+                            "-ww",
+                            "-p",
+                            ",".join(pids),
+                            "-o",
+                            "pid,ruser,etime,args",
+                            "--sort",
+                            "+lstart",
+                        ]
+                    ).decode()
+                except FileNotFoundError:
+                    print(message.error("Error: did not find `ps` command"))
+                    print(
+                        message.warn(f"Use `attach <pid>` instead (found pids: {', '.join(pids)})")
+                    )
+                    return
+                except CalledProcessError:
+                    print(message.error("Error: failed to get process details"))
+                    print(
+                        message.warn(f"Use `attach <pid>` instead (found pids: {', '.join(pids)})")
+                    )
+                    return
+
+                print(
+                    message.warn(
+                        f'Multiple processes found. Current resolution method is "{method}". Run the command `config attachp-resolution-method` to see more informations.'
+                    )
+                )
+
+                # Here, we can safely use split to capture each field
+                # since none of the columns except args can contain spaces
+                proc_infos = [row.split(maxsplit=3) for row in ps_output.splitlines()]
+                if method == _OLDEST:
+                    resolved_target = int(proc_infos[0][0])
+                elif method == _NEWEST:
+                    resolved_target = int(proc_infos[-1][0])
+                else:
+                    headers = ["pid", "user", "elapsed", "command"]
+                    showindex: Union[bool, range] = (
+                        False if method == _NONE else range(1, len(proc_infos) + 1)
+                    )
+
+                    # calculate max_col_widths to fit window width
+                    test_table = tabulate(proc_infos, headers=headers, showindex=showindex)
+                    table_orig_width = len(test_table.splitlines()[1])
+                    max_command_width = max(len(command) for _, _, _, command in proc_infos)
+                    max_col_widths = max(
+                        max_command_width - (table_orig_width - get_window_size()[1]), 10
+                    )
+
+                    # truncation
+                    if not no_truncate:
+                        for info in proc_infos:
+                            info[-1] = _truncate_string(info[-1], max_col_widths)
+
+                    msg = tabulate(
+                        proc_infos,
+                        headers=headers,
+                        showindex=showindex,
+                        maxcolwidths=max_col_widths,
+                    )
+                    print(message.notice(msg))
+
+                    if method == _NONE:
+                        print(message.warn("use `attach <pid>` to attach"))
+                        return
+                    elif method == _ASK:
+                        while True:
+                            msg = message.notice(f"which process to attach?(1-{len(proc_infos)}) ")
+                            try:
+                                inp = input(msg).strip()
+                            except EOFError:
+                                return
+                            try:
+                                choice = int(inp)
+                                if not (1 <= choice <= len(proc_infos)):
+                                    continue
+                            except ValueError:
+                                continue
+                            break
+                        resolved_target = int(proc_infos[choice - 1][0])
+                    else:
+                        raise Exception("unreachable")
+            else:
+                resolved_target = int(pids[0])
 
     print(message.on(f"Attaching to {resolved_target}"))
     try:
         gdb.execute(f"attach {resolved_target}")
     except gdb.error as e:
         print(message.error(f"Error: {e}"))
+        return
 
 
 def _is_device(path) -> bool:
@@ -92,3 +272,14 @@ def _is_device(path) -> bool:
         return True
 
     return False
+
+
+def _truncate_string(s: str, length: int):
+    TRUNCATE_FILLER = " ... "
+    if len(s) < length:
+        return s
+    truncate_point = (length - len(TRUNCATE_FILLER)) // 2
+    result = s[:truncate_point]
+    result += TRUNCATE_FILLER
+    result += s[-(length - len(result)) :]
+    return result

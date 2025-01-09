@@ -7,6 +7,7 @@ import subprocess
 
 import gdb
 
+import pwndbg.aglib.proc
 import tests
 
 REFERENCE_BINARY_NET = tests.binaries.get("reference-binary-net.out")
@@ -28,8 +29,8 @@ def test_command_procinfo(start_binary):
         start_new_session=True,
     )
 
-    bin_path = gdb.execute("pi pwndbg.gdblib.proc.exe", to_string=True).strip("\n")
-    pid = gdb.execute("pi pwndbg.gdblib.proc.pid", to_string=True).strip("\n")
+    bin_path = pwndbg.aglib.proc.exe
+    pid = str(pwndbg.aglib.proc.pid)
 
     gdb.execute("break break_here")
     gdb.execute("continue")
@@ -38,7 +39,7 @@ def test_command_procinfo(start_binary):
     res_list = result.split("\n")
 
     assert bin_path in res_list[0]
-    assert pid in res_list[1]
+    assert pid in res_list[3]
     assert "127.0.0.1:31337" in result
 
     # Close netcat

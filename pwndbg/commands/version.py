@@ -2,7 +2,6 @@
 Displays gdb, python and pwndbg versions.
 """
 
-
 from __future__ import annotations
 
 import argparse
@@ -19,12 +18,12 @@ import gdb
 
 import pwndbg
 import pwndbg.commands
-import pwndbg.ida
+import pwndbg.integration
 from pwndbg.color import message
 from pwndbg.commands import CommandCategory
 
 
-def _gdb_version():
+def _gdb_version() -> str:
     return gdb.VERSION
 
 
@@ -60,13 +59,7 @@ def all_versions():
 
     all_versions = (gdb_str, py_str, pwndbg_str, capstone_str, unicorn_str)
 
-    ida_versions = pwndbg.ida.get_ida_versions()
-
-    if ida_versions is not None:
-        ida_version = f"IDA PRO:  {ida_versions['ida']}"
-        ida_py_ver = f"IDA Py:   {ida_versions['python']}"
-        ida_hr_ver = f"Hexrays:  {ida_versions['hexrays']}"
-        all_versions += (ida_version, ida_py_ver, ida_hr_ver)
+    all_versions += pwndbg.integration.provider.get_versions()
     return all_versions
 
 
@@ -182,12 +175,16 @@ If it is somehow unavailable, use:
     charset_info = sys.getdefaultencoding()
     current_setup += f"Charset: {charset_info}\n"
 
-    # 8. showing width
-    width_info = os.get_terminal_size().columns
-    current_setup += f"Width: {width_info}\n"
+    # 8. showing width, height
+    try:
+        width_info = os.get_terminal_size().columns
+        height_info = os.get_terminal_size().lines
+    except OSError:
+        # Terminal size may not be available in non-interactive environments (e.g., scripts, IDEs)
+        width_info = "no terminal size"
+        height_info = "no terminal size"
 
-    # 9. showing height
-    height_info = os.get_terminal_size().lines
+    current_setup += f"Width: {width_info}\n"
     current_setup += f"Height: {height_info}\n"
 
     current_setup += "\n".join(all_info)
@@ -255,7 +252,6 @@ If it is somehow unavailable, use:
                 check_call(["gh", "issue", "create", "--body-file", f.name])
         except Exception:
             print(please_please_submit + github_issue_url)
-            raise
     elif run_browser:
         try:
             check_output(["xdg-open", github_issue_url + github_issue_body])

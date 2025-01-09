@@ -1,9 +1,21 @@
 from __future__ import annotations
 
-import collections
+from typing import List
+from typing import NamedTuple
 
-Function = collections.namedtuple("Function", ("type", "derefcnt", "name", "args"))
-Argument = collections.namedtuple("Argument", ("type", "derefcnt", "name"))
+
+class Function(NamedTuple):
+    type: str
+    derefcnt: int
+    name: str
+    args: List[Argument]
+
+
+class Argument(NamedTuple):
+    type: str
+    derefcnt: int
+    name: str
+
 
 functions = {
     "ASN1_BIT_STRING_check": Function(
