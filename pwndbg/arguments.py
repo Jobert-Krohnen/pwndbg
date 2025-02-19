@@ -2,85 +2,36 @@
 Allows describing functions, specifically enumerating arguments which
 may be passed in a combination of registers and stack values.
 """
+
 from __future__ import annotations
 
-import gdb
-from capstone import CS_GRP_CALL
+from typing import List
+from typing import Tuple
+
 from capstone import CS_GRP_INT
 
+import pwndbg.aglib.arch
+import pwndbg.aglib.disasm
+import pwndbg.aglib.disasm.arch
+import pwndbg.aglib.file
+import pwndbg.aglib.memory
+import pwndbg.aglib.proc
+import pwndbg.aglib.regs
+import pwndbg.aglib.symbol
+import pwndbg.aglib.typeinfo
 import pwndbg.chain
-import pwndbg.constants
-import pwndbg.disasm
-import pwndbg.gdblib.arch
-import pwndbg.gdblib.memory
-import pwndbg.gdblib.regs
-import pwndbg.gdblib.symbol
-import pwndbg.gdblib.typeinfo
-import pwndbg.ida
+import pwndbg.integration
 import pwndbg.lib.abi
 import pwndbg.lib.funcparser
 import pwndbg.lib.functions
-from pwndbg.gdblib.nearpc import c as N
-
-ida_replacements = {
-    "__int64": "signed long long int",
-    "__int32": "signed int",
-    "__int16": "signed short",
-    "__int8": "signed char",
-    "__uint64": "unsigned long long int",
-    "__uint32": "unsigned int",
-    "__uint16": "unsigned short",
-    "__uint8": "unsigned char",
-    "_BOOL_1": "unsigned char",
-    "_BOOL_2": "unsigned short",
-    "_BOOL_4": "unsigned int",
-    "_BYTE": "unsigned char",
-    "_WORD": "unsigned short",
-    "_DWORD": "unsigned int",
-    "_QWORD": "unsigned long long",
-    "__pure": "",
-    "__hidden": "",
-    "__return_ptr": "",
-    "__struct_ptr": "",
-    "__array_ptr": "",
-    "__fastcall": "",
-    "__cdecl": "",
-    "__thiscall": "",
-    "__userpurge": "",
-}
+from pwndbg.aglib.disasm.instruction import PwndbgInstruction
+from pwndbg.aglib.nearpc import c as N
 
 
-def get_syscall_name(instruction):
-    if CS_GRP_INT not in instruction.groups:
-        return None
-
-    syscall_register = pwndbg.lib.abi.ABI.syscall().syscall_register
-    syscall_arch = pwndbg.gdblib.arch.current
-
-    # On x86/x64 `syscall` and `int <value>` instructions are in CS_GRP_INT
-    # but only `syscall` and `int 0x80` actually execute syscalls on Linux.
-    # So here, we return no syscall name for other instructions and we also
-    # handle a case when 32-bit syscalls are executed on x64
-    if syscall_register in ("eax", "rax"):
-        mnemonic = instruction.mnemonic
-
-        is_32bit = mnemonic == "int" and instruction.op_str == "0x80"
-        if not (mnemonic == "syscall" or is_32bit):
-            return None
-
-        # On x64 the int 0x80 instruction executes 32-bit syscalls from i386
-        # On x86, the syscall_arch is already i386, so its all fine
-        if is_32bit:
-            syscall_arch = "i386"
-
-    syscall_number = getattr(pwndbg.gdblib.regs, syscall_register)
-    return pwndbg.constants.syscall(syscall_number, syscall_arch) or "<unk_%d>" % syscall_number
-
-
-def get(instruction):
+def get(instruction: PwndbgInstruction) -> List[Tuple[pwndbg.lib.functions.Argument, int]]:
     """
     Returns an array containing the arguments to the current function,
-    if $pc is a 'call' or 'bl' type instruction.
+    if $pc is a 'call', 'bl', or 'jalr' type instruction.
 
     Otherwise, returns None.
     """
@@ -89,34 +40,26 @@ def get(instruction):
     if instruction is None:
         return []
 
-    if instruction.address != pwndbg.gdblib.regs.pc:
+    if instruction.address != pwndbg.aglib.regs.pc:
         return []
 
-    if CS_GRP_CALL in instruction.groups:
+    if instruction.call_like:
         try:
             abi = pwndbg.lib.abi.ABI.default()
         except KeyError:
             return []
 
-        # Not sure of any OS which allows multiple operands on
-        # a call instruction.
-        assert len(instruction.operands) == 1
-
-        target = instruction.operands[0].int
+        target = instruction.target
 
         if not target:
             return []
 
-        if pwndbg.gdblib.arch.current in ["rv32", "rv64"]:
-            target += instruction.address
-            target &= pwndbg.gdblib.arch.ptrmask
-
-        name = pwndbg.gdblib.symbol.get(target)
+        name = pwndbg.aglib.symbol.resolve_addr(target)
         if not name:
             return []
     elif CS_GRP_INT in instruction.groups:
         # Get the syscall number and name
-        name = get_syscall_name(instruction)
+        name = instruction.syscall_name
         abi = pwndbg.lib.abi.ABI.syscall()
         target = None
 
@@ -128,7 +71,7 @@ def get(instruction):
     result = []
     name = name or ""
 
-    sym = gdb.lookup_symbol(name)
+    sym = pwndbg.aglib.symbol.lookup_frame_symbol(name)
     name = name.replace("isoc99_", "")  # __isoc99_sscanf
     name = name.replace("@plt", "")  # getpwiod@plt
 
@@ -141,29 +84,20 @@ def get(instruction):
 
     func = pwndbg.lib.functions.functions.get(name, None)
 
-    # Try to extract the data from GDB.
-    # Note that this is currently broken, pending acceptance of
-    # my patch: https://sourceware.org/ml/gdb-patches/2015-06/msg00268.html
-    if sym and sym[0]:
+    if sym:
         try:
-            n_args_default = len(sym[0].type.fields())
-        except TypeError:
-            pass
+            target_type = sym.type.target()
+        except Exception:
+            target_type = sym.type
+
+        if target_type and target_type.code == pwndbg.dbg_mod.TypeCode.FUNC:
+            func_args = target_type.func_arguments()
+            if func_args is not None:
+                n_args_default = len(func_args)
 
     # Try to grab the data out of IDA
     if not func and target:
-        typename = pwndbg.ida.GetType(target)
-
-        if typename:
-            typename += ";"
-
-            # GetType() does not include the name.
-            typename = typename.replace("(", " function_name(", 1)
-
-            for k, v in ida_replacements.items():
-                typename = typename.replace(k, v)
-
-            func = pwndbg.lib.funcparser.ExtractFuncDeclFromSource(typename + ";")
+        func = pwndbg.integration.provider.get_func_type(target)
 
     if func:
         args = func.args
@@ -178,7 +112,7 @@ def get(instruction):
     return result
 
 
-def argname(n, abi=None):
+def argname(n: int, abi: pwndbg.lib.abi.ABI | None = None) -> str:
     abi = abi or pwndbg.lib.abi.ABI.default()
     regs = abi.register_arguments
 
@@ -188,7 +122,7 @@ def argname(n, abi=None):
     return "arg[%i]" % n
 
 
-def argument(n, abi=None):
+def argument(n: int, abi: pwndbg.lib.abi.ABI | None = None) -> int:
     """
     Returns the nth argument, as if $pc were a 'call' or 'bl' type
     instruction.
@@ -198,16 +132,16 @@ def argument(n, abi=None):
     regs = abi.register_arguments
 
     if n < len(regs):
-        return getattr(pwndbg.gdblib.regs, regs[n])
+        return getattr(pwndbg.aglib.regs, regs[n])
 
     n -= len(regs)
 
-    sp = pwndbg.gdblib.regs.sp + (n * pwndbg.gdblib.arch.ptrsize)
+    sp = pwndbg.aglib.regs.sp + (n * pwndbg.aglib.arch.ptrsize)
 
-    return int(pwndbg.gdblib.memory.poi(pwndbg.gdblib.typeinfo.ppvoid, sp))
+    return int(pwndbg.aglib.memory.get_typed_pointer_value(pwndbg.aglib.typeinfo.ppvoid, sp))
 
 
-def arguments(abi=None):
+def arguments(abi: pwndbg.lib.abi.ABI | None = None):
     """
     Yields (arg_name, arg_value) tuples for arguments from a given ABI.
     Works only for ABIs that use registers for arguments.
@@ -219,7 +153,7 @@ def arguments(abi=None):
         yield argname(i, abi), argument(i, abi)
 
 
-def format_args(instruction):
+def format_args(instruction: PwndbgInstruction) -> List[str]:
     result = []
     for arg, value in get(instruction):
         code = arg.type != "char"
@@ -228,9 +162,9 @@ def format_args(instruction):
         # Enhance args display
         if arg.name == "fd" and isinstance(value, int):
             # Cannot find PID of the QEMU program: perhaps it is in a different pid namespace or we have no permission to read the QEMU process' /proc/$pid/fd/$fd file.
-            pid = pwndbg.gdblib.proc.pid
+            pid = pwndbg.aglib.proc.pid
             if pid is not None:
-                path = pwndbg.gdblib.file.readlink("/proc/%d/fd/%d" % (pid, value))
+                path = pwndbg.aglib.file.readlink("/proc/%d/fd/%d" % (pid, value))
                 if path:
                     pretty += f" ({path})"
 

@@ -6,13 +6,13 @@ from __future__ import annotations
 
 import argparse
 import queue
+from typing import Dict
+from typing import List
 
-import gdb
-
+import pwndbg
+import pwndbg.aglib.vmmap
 import pwndbg.color.memory as M
 import pwndbg.commands
-import pwndbg.gdblib.config
-import pwndbg.gdblib.vmmap
 from pwndbg.chain import c as C
 from pwndbg.color import message
 from pwndbg.commands import CommandCategory
@@ -22,8 +22,8 @@ from pwndbg.commands import CommandCategory
 # addr is a pointer. It is taken to be a child pointer.
 # visited_map is a map of children -> (parent,parent_start)
 def get_rec_addr_string(addr, visited_map):
-    page = pwndbg.gdblib.vmmap.find(addr)
-    arrow_right = C.arrow(" %s " % pwndbg.gdblib.config.chain_arrow_right)
+    page = pwndbg.aglib.vmmap.find(addr)
+    arrow_right = C.arrow(" %s " % pwndbg.config.chain_arrow_right)
 
     if page is not None:
         if addr not in visited_map:
@@ -78,23 +78,31 @@ parser.add_argument(
 parser.add_argument(
     "-o",
     "--max_offset",
+    type=int,
     default=0x48,
     nargs="?",
     help="Max offset to add to addresses when looking for leak",
 )
 parser.add_argument(
-    "-d", "--max_depth", default=0x4, nargs="?", help="Maximum depth to follow pointers to"
+    "-d",
+    "--max_depth",
+    type=int,
+    default=0x4,
+    nargs="?",
+    help="Maximum depth to follow pointers to",
 )
 parser.add_argument(
     "-s",
     "--step",
     nargs="?",
+    type=int,
     default=0x1,
     help="Step to add between pointers so they are considered. For example, if this is 4 it would only consider pointers at an offset divisible by 4 from the starting pointer",
 )
 parser.add_argument(
     "--negative_offset",
     nargs="?",
+    type=int,
     default=0x0,
     help="Max negative offset to search before an address when looking for a leak",
 )
@@ -103,28 +111,32 @@ parser.add_argument(
 @pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.MEMORY)
 @pwndbg.commands.OnlyWhenRunning
 def leakfind(
-    address=None, page_name=None, max_offset=0x40, max_depth=0x4, step=0x1, negative_offset=0x0
+    address=None,
+    page_name=None,
+    max_offset: int = 0x40,
+    max_depth: int = 0x4,
+    step: int = 0x1,
+    negative_offset: int = 0x0,
 ):
     if address is None:
         raise argparse.ArgumentTypeError("No starting address provided.")
-    foundPages = pwndbg.gdblib.vmmap.find(address)
+
+    address = int(address)
+
+    foundPages = pwndbg.aglib.vmmap.find(address)
 
     if not foundPages:
         raise argparse.ArgumentTypeError("Starting address is not mapped.")
 
-    if not pwndbg.gdblib.memory.peek(address):
+    if not pwndbg.aglib.memory.peek(address):
         raise argparse.ArgumentTypeError("Unable to read from starting address.")
 
-    max_depth = int(max_depth)
     # Just warn the user that a large depth might be slow.
     # Probably worth checking offset^depth < threshold. Do this when more benchmarking is established.
     if max_depth > 8:
         print(message.warn("leakfind may take a while to run on larger depths."))
 
-    stride = int(step)
-    address = int(address)
-    max_offset = int(max_offset)
-    negative_offset = int(negative_offset)
+    stride = step
 
     # The below map stores a map of child address->(parent_address,parent_start_address)
     # In the above tuple, parent_address is the exact address with a pointer to the child address.
@@ -132,14 +144,14 @@ def leakfind(
     # We need to store both so that we can nicely create our leak chain.
     visited_map = {}
     visited_set = {int(address)}
-    address_queue: queue.Queue[int] = queue.Queue()
+    address_queue: "queue.Queue[int]" = queue.Queue()
     address_queue.put(int(address))
     depth = 0
     time_to_depth_increase = 0
 
     # Run a bfs
-    # TODO look into performance gain from checking if an address is mapped before calling pwndbg.gdblib.memory.pvoid()
-    # TODO also check using pwndbg.gdblib.memory.read for possible performance boosts.
+    # TODO look into performance gain from checking if an address is mapped before calling pwndbg.aglib.memory.pvoid()
+    # TODO also check using pwndbg.aglib.memory.read for possible performance boosts.
     while address_queue.qsize() > 0 and depth < max_depth:
         if time_to_depth_increase == 0:
             depth = depth + 1
@@ -150,8 +162,8 @@ def leakfind(
             cur_start_addr - negative_offset, cur_start_addr + max_offset, stride
         ):
             try:
-                cur_addr &= pwndbg.gdblib.arch.ptrmask
-                result = int(pwndbg.gdblib.memory.pvoid(cur_addr))
+                cur_addr &= pwndbg.aglib.arch.ptrmask
+                result = int(pwndbg.aglib.memory.pvoid(cur_addr))
                 if result in visited_map or result in visited_set:
                     continue
                 visited_map[result] = (
@@ -160,16 +172,16 @@ def leakfind(
                 )  # map is of form child->(parent,parent_start)
                 address_queue.put(result)
                 visited_set.add(result)
-            except gdb.error:
+            except pwndbg.dbg_mod.Error:
                 # That means the memory was unmapped. Just skip it if we can't read it.
                 break
 
     # A map of length->list of lines. Used to let us print in a somewhat nice manner.
-    output_map: dict[int, list[str]] = {}
-    arrow_right = C.arrow(" %s " % pwndbg.gdblib.config.chain_arrow_right)
+    output_map: Dict[int, List[str]] = {}
+    arrow_right = C.arrow(" %s " % pwndbg.config.chain_arrow_right)
 
     for child in visited_map:
-        child_page = pwndbg.gdblib.vmmap.find(child)
+        child_page = pwndbg.aglib.vmmap.find(child)
         if child_page is not None:
             if page_name is not None and page_name not in child_page.objfile:
                 continue
@@ -190,5 +202,5 @@ def leakfind(
         for line in lines:
             print(line)
 
-    if pwndbg.gdblib.qemu.is_qemu():
+    if pwndbg.aglib.qemu.is_qemu():
         print("\n[QEMU target detected - leakfind result might not be accurate; see `help vmmap`]")

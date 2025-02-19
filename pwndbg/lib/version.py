@@ -27,7 +27,7 @@ def build_id() -> str:
         return ""
 
 
-__version__ = "2023.07.17"
+__version__ = "2025.02.19"
 
 b_id = build_id()
 

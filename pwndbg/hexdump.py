@@ -7,12 +7,13 @@ from __future__ import annotations
 import math
 import string
 
-import gdb
 import pwnlib.util.lists
 
+import pwndbg
+import pwndbg.aglib.arch
+import pwndbg.aglib.memory
+import pwndbg.aglib.typeinfo
 import pwndbg.color.hexdump as H
-import pwndbg.gdblib.config
-import pwndbg.gdblib.typeinfo
 from pwndbg.color import theme
 from pwndbg.commands.windbg import enhex
 
@@ -37,7 +38,7 @@ config_byte_separator = theme.add_param(
 )
 
 
-@pwndbg.gdblib.config.trigger(
+@pwndbg.config.trigger(
     H.config_normal, H.config_zero, H.config_special, H.config_printable, config_colorize_ascii
 )
 def load_color_scheme() -> None:
@@ -54,33 +55,33 @@ def load_color_scheme() -> None:
     ):
         color_scheme[c] = H.printable("%02x" % c)
         printable[c] = (
-            H.printable(f"{chr(c)}") if pwndbg.gdblib.config.hexdump_colorize_ascii else f"{chr(c)}"
+            H.printable(f"{chr(c)}") if pwndbg.config.hexdump_colorize_ascii else f"{chr(c)}"
         )
 
     for c in bytearray(b"\x00"):
         color_scheme[c] = H.zero("%02x" % c)
-        printable[c] = H.zero(".") if pwndbg.gdblib.config.hexdump_colorize_ascii else "."
+        printable[c] = H.zero(".") if pwndbg.config.hexdump_colorize_ascii else "."
 
     for c in bytearray(b"\xff\x7f\x80"):
         color_scheme[c] = H.special("%02x" % c)
-        printable[c] = H.special(".") if pwndbg.gdblib.config.hexdump_colorize_ascii else "."
+        printable[c] = H.special(".") if pwndbg.config.hexdump_colorize_ascii else "."
 
     color_scheme[-1] = "  "
     printable[-1] = " "
 
 
 def hexdump(
-    data,
-    address=0,
-    width=16,
-    group_width=4,
-    flip_group_endianess=False,
-    skip=True,
-    offset=0,
-    size=0,
-    count=0,
-    repeat=False,
-    dX_call=False,
+    data: bytes,
+    address: int = 0,
+    width: int = 16,
+    group_width: int = 4,
+    flip_group_endianness: bool = False,
+    skip: bool = True,
+    offset: int = 0,
+    size: int = 0,
+    count: int = 0,
+    repeat: bool = False,
+    dX_call: bool = False,
 ):
     if not dX_call:
         if not color_scheme or not printable:
@@ -88,7 +89,7 @@ def hexdump(
 
         # If there's nothing to print, just print the offset and address and return
         if not data:
-            yield H.offset("+%04x " % len(data)) + H.address("%#08x  " % (address + len(data)))
+            yield H.offset(f"+{offset:04x} ") + H.address(f"{address:#08x}  ")
 
             # Don't allow iterating over this generator again
             return
@@ -128,15 +129,16 @@ def hexdump(
                     yield out
                     # Fallthrough (do not continue) so we yield the current line too
 
+            increment = i * width
             hexline = [
-                H.offset("+%04x " % ((i + offset) * width)),
-                H.address("%#08x  " % (address + (i * width))),
+                H.offset(f"+{offset + increment:04x} "),
+                H.address(f"{address + increment:#08x}  "),
             ]
 
             for group in groupby(group_width, line):
-                group = reversed(group) if flip_group_endianess else group
+                group = reversed(group) if flip_group_endianness else group
                 for idx, char in enumerate(group):
-                    if flip_group_endianess and idx == group_width - 1:
+                    if flip_group_endianness and idx == group_width - 1:
                         hexline.append(H.highlight_group_lsb(color_scheme[char]))
                     else:
                         hexline.append(color_scheme[char])
@@ -159,16 +161,16 @@ def hexdump(
             count = hexdump.last_count
             address = hexdump.last_address
         else:
-            address = int(address) & pwndbg.gdblib.arch.ptrmask
+            address = int(address) & pwndbg.aglib.arch.ptrmask
             count = int(count)
 
-        size_type = pwndbg.gdblib.typeinfo.get_type(size)
+        size_type = pwndbg.aglib.typeinfo.get_type(size)
 
         for i in range(count):
             try:
-                gval = pwndbg.gdblib.memory.poi(size_type, address + i * size)
+                gval = pwndbg.aglib.memory.get_typed_pointer_value(size_type, address + i * size)
                 values.append(int(gval))
-            except gdb.MemoryError:
+            except pwndbg.dbg_mod.Error:
                 break
 
         if not values:
@@ -183,7 +185,7 @@ def hexdump(
         for i, row in enumerate(rows):
             if not row:
                 continue
-            line = [enhex(pwndbg.gdblib.arch.ptrsize, address + (i * 16)), "   "]
+            line = [enhex(pwndbg.aglib.arch.ptrsize, address + (i * 16)), "   "]
             for value in row:
                 line.append(enhex(size, value))
             lines.append(" ".join(line))

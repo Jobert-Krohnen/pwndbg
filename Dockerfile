@@ -8,15 +8,17 @@
 #   docker run -it --cap-add=SYS_PTRACE --security-opt seccomp=unconfined -v `pwd`:/pwndbg pwndbg bash
 #
 
-ARG image=ubuntu:20.04
+ARG image=mcr.microsoft.com/devcontainers/base:jammy
 FROM $image
 
 WORKDIR /pwndbg
 
+ENV PIP_NO_CACHE_DIR=true
 ENV LANG en_US.utf8
 ENV TZ=America/New_York
 ENV ZIGPATH=/opt/zig
 ENV PWNDBG_VENV_PATH=/venv
+ENV UV_PROJECT_ENVIRONMENT=/venv
 
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
     echo $TZ > /etc/timezone && \
@@ -28,27 +30,30 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
     apt-get install -y vim
 
 ADD ./setup.sh /pwndbg/
-ADD ./poetry.lock /pwndbg/
+ADD ./uv.lock /pwndbg/
 ADD ./pyproject.toml /pwndbg/
-ADD ./dev-requirements.txt /pwndbg/
 
 # pyproject.toml requires these files, pip install would fail
-RUN touch README.md && mkdir pwndbg && touch pwndbg/empty.py && mkdir gdb-pt-dump && touch gdb-pt-dump/empty.py
+RUN touch README.md && mkdir pwndbg && touch pwndbg/empty.py
 
-# The `git submodule` is commented because it refreshes all the sub-modules in the project
-# but at this time we only need the essentials for the set up. It will execute at the end.
-RUN sed -i "s/^git submodule/#git submodule/" ./setup.sh && \
-    DEBIAN_FRONTEND=noninteractive ./setup.sh
-
-# Cleanup dummy files
-RUN rm README.md && rm -rf pwndbg && rm -rf gdb-pt-dump
+RUN DEBIAN_FRONTEND=noninteractive ./setup.sh
 
 # Comment these lines if you won't run the tests.
 ADD ./setup-dev.sh /pwndbg/
 RUN ./setup-dev.sh
 
-RUN echo "source /pwndbg/gdbinit.py" >> ~/.gdbinit.py
+# Cleanup dummy files
+RUN rm README.md && rm -rf pwndbg
 
 ADD . /pwndbg/
 
-RUN git submodule update --init --recursive
+ARG LOW_PRIVILEGE_USER="vscode"
+
+ENV PATH="${PWNDBG_VENV_PATH}/bin:${PATH}"
+
+# Add .gdbinit to the home folder of both root and vscode users (if vscode user exists)
+# This is useful for a VSCode dev container, not really for test builds
+RUN if [ ! -f ~/.gdbinit ]; then echo "source /pwndbg/gdbinit.py" >> ~/.gdbinit; fi && \
+    if id -u ${LOW_PRIVILEGE_USER} > /dev/null 2>&1; then \
+        su ${LOW_PRIVILEGE_USER} -c 'if [ ! -f ~/.gdbinit ]; then echo "source /pwndbg/gdbinit.py" >> ~/.gdbinit; fi'; \
+    fi

@@ -6,28 +6,77 @@ from __future__ import annotations
 
 import binascii
 import re
+import string
+from typing import Dict
+from typing import List
+from typing import NamedTuple
+from typing import Tuple
 
 import capstone as C
-import gdb
 import unicorn as U
 import unicorn.riscv_const
 
-import pwndbg.disasm
-import pwndbg.gdblib.arch
-import pwndbg.gdblib.memory
-import pwndbg.gdblib.regs
+import pwndbg.aglib.arch
+import pwndbg.aglib.disasm
+import pwndbg.aglib.memory
+import pwndbg.aglib.regs
+import pwndbg.aglib.strings
+import pwndbg.aglib.symbol
+import pwndbg.aglib.vmmap
+import pwndbg.chain
+import pwndbg.color.enhance as E
+import pwndbg.color.memory as M
+import pwndbg.dbg
+import pwndbg.enhance
+import pwndbg.integration
+import pwndbg.lib.memory
+import pwndbg.lib.regs
+from pwndbg import color
+from pwndbg.color.syntax_highlight import syntax_highlight
+
+if pwndbg.dbg.is_gdblib_available():
+    import gdb
 
 
-def parse_consts(u_consts):
+def parse_consts(u_consts) -> Dict[str, int]:
     """
     Unicorn "consts" is a python module consisting of a variable definition
     for each known entity. We repack it here as a dict for performance.
+
+    Maps "UC_*" -> integer value of the constant
     """
-    consts = {}
+    consts: Dict[str, int] = {}
     for name in dir(u_consts):
         if name.startswith("UC_"):
             consts[name] = getattr(u_consts, name)
     return consts
+
+
+# Generate Map<Register name, unicorn constant>
+def create_reg_to_const_map(
+    base_consts: Dict[str, int], additional_mapping: Dict[str, int] = None
+) -> Dict[str, int]:
+    # base_consts is Map<"UC_*_REG_", constant>
+    # additional mapping is the manually additions that add to the returned dict
+
+    # Create a map of "register_name" -> Capstone ID, for faster lookup
+    # Example of one field in the mapping for x86: { "RAX": 35 }
+    reg_to_const: Dict[str, int] = {}
+
+    r = re.compile(r"^UC_.*_REG_(.*)$")
+    for k, v in base_consts.items():
+        # Use regex to match the Capstone register names to our register names.
+        # Ex: extract "RCX" from "UC_X86_REG_RCX"
+        # All are uppercase
+        m = r.match(k)
+
+        if m:
+            reg_to_const[m.group(1)] = v
+
+    if additional_mapping is not None:
+        reg_to_const.update(additional_mapping)
+
+    return reg_to_const
 
 
 # Map our internal architecture names onto Unicorn Engine's architecture types.
@@ -37,35 +86,71 @@ arch_to_UC = {
     "mips": U.UC_ARCH_MIPS,
     "sparc": U.UC_ARCH_SPARC,
     "arm": U.UC_ARCH_ARM,
+    "armcm": U.UC_ARCH_ARM,
     "aarch64": U.UC_ARCH_ARM64,
     # 'powerpc': U.UC_ARCH_PPC,
     "rv32": U.UC_ARCH_RISCV,
     "rv64": U.UC_ARCH_RISCV,
 }
 
+# Architecture specific maps: Map<"UC_*_REG_*",constant>
 arch_to_UC_consts = {
     "i386": parse_consts(U.x86_const),
     "x86-64": parse_consts(U.x86_const),
     "mips": parse_consts(U.mips_const),
     "sparc": parse_consts(U.sparc_const),
     "arm": parse_consts(U.arm_const),
+    "armcm": parse_consts(U.arm_const),
     "aarch64": parse_consts(U.arm64_const),
     "rv32": parse_consts(U.riscv_const),
     "rv64": parse_consts(U.riscv_const),
 }
 
+# Architecture specific maps: Map<reg_name, Unicorn constant>
+arch_to_reg_const_map = {
+    "i386": create_reg_to_const_map(arch_to_UC_consts["i386"]),
+    "x86-64": create_reg_to_const_map(
+        arch_to_UC_consts["x86-64"],
+        {"FSBASE": U.x86_const.UC_X86_REG_FS_BASE, "GSBASE": U.x86_const.UC_X86_REG_GS_BASE},
+    ),
+    "mips": create_reg_to_const_map(arch_to_UC_consts["mips"]),
+    "sparc": create_reg_to_const_map(arch_to_UC_consts["sparc"]),
+    "arm": create_reg_to_const_map(arch_to_UC_consts["arm"]),
+    "armcm": create_reg_to_const_map(arch_to_UC_consts["armcm"]),
+    "aarch64": create_reg_to_const_map(
+        arch_to_UC_consts["aarch64"], {"CPSR": U.arm64_const.UC_ARM64_REG_NZCV}
+    ),
+    "rv32": create_reg_to_const_map(arch_to_UC_consts["rv32"]),
+    "rv64": create_reg_to_const_map(arch_to_UC_consts["rv64"]),
+}
 
-DEBUG = False
 
+# combine the flags with | operator. -1 for all
+(
+    NO_DEBUG,
+    DEBUG_INIT,
+    DEBUG_EXECUTING,
+    DEBUG_MEM_MAP,
+    DEBUG_HOOK_CHANGE,
+    DEBUG_MEM_READ,
+    DEBUG_EMU_START_STOP,
+    DEBUG_INTERRUPT,
+    DEBUG_TRACE,
+) = (0, 1, 2, 4, 8, 16, 32, 64, 128)
 
-if DEBUG:
+DEBUG = NO_DEBUG
+# DEBUG = -1 # ALL
+# DEBUG = DEBUG_EXECUTING | DEBUG_MEM_MAP | DEBUG_MEM_READ
 
-    def debug(fmt, args=()) -> None:
-        print(fmt % args)
+if DEBUG != NO_DEBUG:
+
+    def debug(debug_type, fmt, args=()) -> None:
+        if DEBUG & debug_type:
+            print(fmt % args)
 
 else:
 
-    def debug(fmt, args=()) -> None:
+    def debug(debug_type, fmt, args=()) -> None:
         pass
 
 
@@ -93,7 +178,22 @@ arch_to_SYSCALL = {
     U.UC_ARCH_RISCV: [C.riscv_const.RISCV_INS_ECALL],
 }
 
-blacklisted_regs = ["ip", "cs", "ds", "es", "fs", "gs", "ss", "fsbase", "gsbase"]
+ARM_BANNED_INSTRUCTIONS = {
+    C.arm.ARM_INS_MRC,
+    C.arm.ARM_INS_MRRC,
+    C.arm.ARM_INS_MRC2,
+    C.arm.ARM_INS_MRRC2,
+}
+# We stop emulation when hitting these instructions, since they depend on co-processors or other information
+# unavailable to the emulator
+BANNED_INSTRUCTIONS = {
+    "mips": {C.mips.MIPS_INS_RDHWR},
+    "arm": ARM_BANNED_INSTRUCTIONS,
+    "armcm": ARM_BANNED_INSTRUCTIONS,
+}
+
+# https://github.com/unicorn-engine/unicorn/issues/550
+blacklisted_regs = ["ip", "cs", "ds", "es", "fs", "gs", "ss"]
 
 """
 e = pwndbg.emu.emulator.Emulator()
@@ -101,54 +201,61 @@ e.until_jump()
 """
 
 
+class InstructionExecutedResult(NamedTuple):
+    address: int
+    size: int
+
+
+# Instantiating an instance of `Emulator` will start an instance
+# with a copy of the current processor state.
 class Emulator:
     def __init__(self) -> None:
-        self.arch = pwndbg.gdblib.arch.current
+        self.arch = pwndbg.aglib.arch.name
 
         if self.arch not in arch_to_UC:
             raise NotImplementedError(f"Cannot emulate code for {self.arch}")
 
-        self.consts = arch_to_UC_consts[self.arch]
-
-        # Just registers, for faster lookup
-        self.const_regs = {}
-        r = re.compile(r"^UC_.*_REG_(.*)$")
-        for k, v in self.consts.items():
-            m = r.match(k)
-            if m:
-                self.const_regs[m.group(1)] = v
+        # Mapping of Pwndbg register name to Unicorn constant for the register
+        self.const_regs = arch_to_reg_const_map[self.arch]
 
         self.uc_mode = self.get_uc_mode()
-        debug("# Instantiating Unicorn for %s", self.arch)
-        debug("uc = U.Uc(%r, %r)", (arch_to_UC[self.arch], self.uc_mode))
+        debug(DEBUG_INIT, "# Instantiating Unicorn for %s", self.arch)
+        debug(DEBUG_INIT, "uc = U.Uc(%r, %r)", (arch_to_UC[self.arch], self.uc_mode))
         self.uc = U.Uc(arch_to_UC[self.arch], self.uc_mode)
-        self.regs = pwndbg.gdblib.regs.current
+
+        self.regs: pwndbg.lib.regs.RegisterSet = pwndbg.aglib.regs.current
+
+        # Whether the emulator is allowed to emulate instructions
+        # There are cases when the emulator is incorrect or we want to disable it for certain instruction types,
+        # and so we can set this to False to indicate that we should not allow the emulator to continue to step
+        self.valid = True
 
         # Jump tracking state
         self._prev = None
         self._prev_size = None
         self._curr = None
 
+        # The address of the last successfully executed instruction using single_step
+        self.last_pc = None
+
+        # (address_successfully_executed, size_of_instruction)
+        self.last_single_step_result = InstructionExecutedResult(None, None)
+
         # Initialize the register state
-        for reg in (
-            list(self.regs.retaddr)
-            + list(self.regs.misc)
-            + list(self.regs.common)
-            + list(self.regs.flags)
-        ):
+        for reg in self.regs.emulated_regs_order:
             enum = self.get_reg_enum(reg)
 
             if not reg:
-                debug("# Could not set register %r", reg)
+                debug(DEBUG_INIT, "# Could not set register %r", reg)
                 continue
 
             if reg in blacklisted_regs:
-                debug("Skipping blacklisted register %r", reg)
+                debug(DEBUG_INIT, "Skipping blacklisted register %r", reg)
                 continue
-            value = getattr(pwndbg.gdblib.regs, reg)
+            value = getattr(pwndbg.aglib.regs, reg)
             if None in (enum, value):
                 if reg not in blacklisted_regs:
-                    debug("# Could not set register %r", reg)
+                    debug(DEBUG_INIT, "# Could not set register %r", reg)
                 continue
 
             # All registers are initialized to zero.
@@ -156,7 +263,7 @@ class Emulator:
                 continue
 
             name = f"U.x86_const.UC_X86_REG_{reg.upper()}"
-            debug("uc.reg_write(%(name)s, %(value)#x)", locals())
+            debug(DEBUG_INIT, "uc.reg_write(%(name)s, %(value)#x)", locals())
             self.uc.reg_write(enum, value)
 
         # Add a hook for unmapped memory
@@ -166,11 +273,268 @@ class Emulator:
         self.hook_add(U.UC_HOOK_INTR, self.hook_intr)
 
         # Map in the page that $pc is on
-        self.map_page(pwndbg.gdblib.regs.pc)
+        self.map_page(pwndbg.aglib.regs.pc)
 
         # Instruction tracing
-        if DEBUG:
+        if DEBUG & DEBUG_TRACE:
             self.hook_add(U.UC_HOOK_CODE, self.trace_hook)
+
+    @property
+    def last_step_succeeded(self) -> bool:
+        return None not in self.last_single_step_result
+
+    def read_register(self, name: str):
+        reg = self.get_reg_enum(name)
+
+        if reg:
+            return self.uc.reg_read(reg)
+
+        return None
+        # raise AttributeError(f"AttributeError: {self!r} object has no register {name!r}")
+
+    # Read size worth of memory, return None on error
+    def read_memory(self, address: int, size: int) -> bytes | None:
+        # Don't attempt if the address is not mapped on the host process
+        if not pwndbg.aglib.vmmap.find(address):
+            return None
+
+        value = None
+        try:
+            # Raises UcError if failed
+            # If the memory is not mapped, it will fail. It will not attempt to run the UC_HOOK_MEM_UNMAPPED hook
+            # https://github.com/unicorn-engine/unicorn/blob/d4b92485b1a228fb003e1218e42f6c778c655809/uc.c#L569
+            value = self.uc.mem_read(address, size)
+        except U.unicorn.UcError as e:
+            # Attempt to map the page manually and try again
+            if e.errno == U.UC_ERR_READ_UNMAPPED:
+                try:
+                    first_page = pwndbg.lib.memory.page_align(address)
+                    last_page_exclusive = pwndbg.lib.memory.page_align(
+                        address + size + pwndbg.lib.memory.PAGE_SIZE
+                    )
+
+                    for page_addr in range(
+                        first_page, last_page_exclusive, pwndbg.lib.memory.PAGE_SIZE
+                    ):
+                        if not (self.map_page(page_addr)):
+                            return None
+
+                    # Pages are mapped, try again
+                    value = self.uc.mem_read(address, size)
+
+                except U.unicorn.UcError:
+                    debug(DEBUG_MEM_READ, "Emulator failed to read memory at %#x, %r", (address, e))
+
+                    return None
+            else:
+                return None
+
+        return bytes(value)
+
+    # Recursively dereference memory, return list of addresses
+    # read_size typically must be either 1, 2, 4, or 8. It dictates the size to read
+    # Naturally, if it is less than the pointer size, then only one value would be telescoped
+    def telescope(self, address: int, limit: int, read_size: int = None) -> List[int]:
+        read_size = read_size if read_size is not None else pwndbg.aglib.arch.ptrsize
+
+        result = [address]
+
+        # This prevents a crash in `unpack_size` below with big (SIMD) memory reads
+        if not read_size <= 8:
+            return result
+
+        for i in range(limit):
+            if result.count(address) >= 2:
+                break
+
+            value = self.read_memory(address, read_size)
+            if value is not None:
+                # address = pwndbg.aglib.arch.unpack(value)
+                address = pwndbg.aglib.arch.unpack_size(value, read_size)
+                address &= pwndbg.aglib.arch.ptrmask
+                result.append(address)
+            else:
+                break
+
+        return result
+
+    # Given an address, return a string like the one `pwndbg.chain.format` returns,
+    # reading from the emulator memory
+    def format_telescope(self, address: int, limit: int) -> str:
+        address_list = self.telescope(address, limit)
+        return self.format_telescope_list(address_list, limit)
+
+    def format_telescope_list(
+        self, chain: List[int], limit: int, enhance_string_len: int = None
+    ) -> str:
+        # Code is near identical to pwndbg.chain.format, but takes into account reading from
+        # the emulator's memory when necessary
+        arrow_left = pwndbg.chain.c.arrow(f" {pwndbg.chain.config_arrow_left} ")
+        arrow_right = pwndbg.chain.c.arrow(f" {pwndbg.chain.config_arrow_right} ")
+
+        # Colorize the chain
+        rest = []
+        for link in chain:
+            symbol = pwndbg.aglib.symbol.resolve_addr(link) or None
+            if symbol:
+                symbol = f"{link:#x} ({symbol})"
+            rest.append(M.get(link, symbol))
+
+        # If the dereference limit is zero, skip any enhancements.
+        if limit == 0:
+            return rest[0]
+
+        # Otherwise replace last element with the enhanced information.
+        rest = rest[:-1]
+
+        # Enhance the last entry
+        # If there are no pointers (e.g. eax = 0x41414141), then enhance it
+        if len(chain) == 1:
+            enhanced = self.telescope_enhance(
+                chain[-1], code=True, enhance_string_len=enhance_string_len
+            )
+        elif len(chain) < limit + 1:
+            enhanced = self.telescope_enhance(
+                chain[-2], code=True, enhance_string_len=enhance_string_len
+            )
+        else:
+            enhanced = pwndbg.chain.c.contiguous_marker(f"{pwndbg.chain.config_contiguous}")
+
+        if len(chain) == 1:
+            return enhanced
+
+        return arrow_right.join(rest) + arrow_left + enhanced
+
+    def telescope_enhance(self, value: int, code: bool = True, enhance_string_len: int = None):
+        # Near identical to pwndbg.enhance.enhance, just read from emulator memory
+
+        # Determine if its on a page - we do this in the real processes memory
+        page = pwndbg.aglib.vmmap.find(value)
+        can_read = True
+        if not page or None is pwndbg.aglib.memory.peek(value):
+            can_read = False
+
+        if not can_read:
+            return E.integer(pwndbg.enhance.int_str(value))
+
+        instr = None
+        exe = page and page.execute
+        rwx = page and page.rwx
+
+        # For the purpose of following pointers, don't display
+        # anything on the stack or heap as 'code'
+        if "[stack" in page.objfile or "[heap" in page.objfile:
+            rwx = exe = False
+
+        # If integration doesn't think it's in a function, don't display it as code.
+        if not pwndbg.integration.provider.is_in_function(value):
+            rwx = exe = False
+
+        if exe:
+            pwndbg_instr = pwndbg.aglib.disasm.one_raw(value)
+            if pwndbg_instr:
+                instr = f"{pwndbg_instr.mnemonic} {pwndbg_instr.op_str}"
+                if pwndbg.config.syntax_highlight:
+                    instr = syntax_highlight(instr)
+
+        # szval = pwndbg.aglib.strings.get(value) or None
+        # Read from emulator memory
+        szval = self.memory_read_string(value, max_string_len=enhance_string_len, max_read=None)
+        szval0 = szval
+        if szval:
+            szval = E.string(repr(szval))
+
+        # Fix for case when we can't read the end address anyway (#946)
+        if value + pwndbg.aglib.arch.ptrsize > page.end:
+            return E.integer(pwndbg.enhance.int_str(value))
+
+        # Read from emulator memory
+        # intval = int(pwndbg.aglib.memory.get_typed_pointer_value(pwndbg.aglib.typeinfo.pvoid, value))
+        read_value = self.read_memory(value, pwndbg.aglib.arch.ptrsize)
+        if read_value is not None:
+            # intval = pwndbg.aglib.arch.unpack(read_value)
+            intval = pwndbg.aglib.arch.unpack_size(read_value, pwndbg.aglib.arch.ptrsize)
+        else:
+            # This occurs when Unicorn fails to read the memory - which it shouldn't, as the
+            # read_memory call will map the pages necessary, and this function assumes
+            # that the pointer is a valid pointer (as it has already been telescoped)
+            intval = 0
+
+        intval0 = intval
+        if 0 <= intval < 10:
+            intval = E.integer(str(intval))
+        else:
+            intval = E.integer("%#x" % int(intval & pwndbg.aglib.arch.ptrmask))
+
+        retval = []
+
+        if not code:
+            instr = None
+
+        # If it's on the stack, don't display it as code in a chain.
+        if instr and "[stack" in page.objfile:
+            retval = [intval, szval]
+        # If it's RWX but a small value, don't display it as code in a chain.
+        elif instr and rwx and intval0 < 0x1000:
+            retval = [intval, szval]
+        # If it's an instruction and *not* RWX, display it unconditionally
+        elif instr and exe:
+            if not rwx:
+                if szval:
+                    retval = [instr, szval]
+                else:
+                    retval = [instr]
+            else:
+                retval = [instr, intval, szval]
+
+        # Otherwise strings have preference
+        elif szval:
+            if len(szval0) < pwndbg.aglib.arch.ptrsize:
+                retval = [intval, szval]
+            else:
+                retval = [szval]
+
+        # And then integer
+        else:
+            return E.integer(pwndbg.enhance.int_str(intval0))
+
+        retval_final: Tuple[str] = tuple(filter(lambda x: x is not None, retval))
+
+        if len(retval_final) == 0:
+            return E.unknown("???")
+
+        if len(retval_final) == 1:
+            return retval_final[0]
+
+        return retval_final[0] + E.comment(color.strip(f" /* {'; '.join(retval_final[1:])} */"))
+
+    # Return None if cannot find str
+    def memory_read_string(self, address: int, max_string_len=None, max_read=None) -> str | None:
+        if max_string_len is None:
+            max_string_len = pwndbg.aglib.strings.length
+
+        if max_read is None:
+            max_read = pwndbg.aglib.strings.length
+
+        # Read string
+        sz = self.read_memory(address, max_read)
+        if sz is None:
+            return None
+
+        try:
+            sz = sz[: sz.index(b"\x00")]
+        except ValueError:
+            return None
+
+        sz = sz.decode("latin-1", "replace")
+
+        if not sz or not all(s in string.printable for s in sz):
+            return None
+
+        if len(sz) < max_string_len or not max_string_len:
+            return sz
+
+        return sz[:max_string_len] + "..."
 
     def __getattr__(self, name: str):
         reg = self.get_reg_enum(name)
@@ -182,33 +546,55 @@ class Emulator:
 
     def update_pc(self, pc=None) -> None:
         if pc is None:
-            pc = pwndbg.gdblib.regs.pc
+            pc = pwndbg.aglib.regs.pc
         self.uc.reg_write(self.get_reg_enum(self.regs.pc), pc)
+
+    def read_thumb_bit(self) -> int:
+        """
+        Return 0 or 1, representing the status of the Thumb bit in the current Arm architecture
+
+        This reads from the emulator itself, meaning this can be read to determine a state
+        transitions between non-Thumb and Thumb mode
+
+        Return None if the Thumb bit is not relevent to the current architecture
+
+        Mimics the `read_thumb_bit` function defined in aglib/arch.py
+        """
+        if self.arch == "arm":
+            if (cpsr := self.cpsr) is not None:
+                return (cpsr >> 5) & 1
+        elif self.arch == "armcm":
+            if (xpsr := self.xpsr) is not None:
+                return (xpsr >> 24) & 1
+        return 0
 
     def get_uc_mode(self):
         """
         Retrieve the mode used by Unicorn for the current architecture.
         """
-        arch = pwndbg.gdblib.arch.current
+        arch = pwndbg.aglib.arch.name
         mode = 0
 
         if arch == "armcm":
             mode |= (
                 (U.UC_MODE_MCLASS | U.UC_MODE_THUMB)
-                if (pwndbg.gdblib.regs.xpsr & (1 << 24))
+                if (pwndbg.aglib.regs.xpsr & (1 << 24))
                 else U.UC_MODE_MCLASS
             )
 
         elif arch in ("arm", "aarch64"):
-            mode |= U.UC_MODE_THUMB if (pwndbg.gdblib.regs.cpsr & (1 << 5)) else U.UC_MODE_ARM
+            mode |= U.UC_MODE_THUMB if (pwndbg.aglib.regs.cpsr & (1 << 5)) else U.UC_MODE_ARM
 
-        elif arch == "mips" and "isa32r6" in gdb.newest_frame().architecture().name():
+        elif (
+            arch == "mips"
+            and pwndbg.dbg.is_gdblib_available()
+            and "isa32r6" in gdb.newest_frame().architecture().name()
+        ):
             mode |= U.UC_MODE_MIPS32R6
-
         else:
-            mode |= {4: U.UC_MODE_32, 8: U.UC_MODE_64}[pwndbg.gdblib.arch.ptrsize]
+            mode |= {4: U.UC_MODE_32, 8: U.UC_MODE_64}[pwndbg.aglib.arch.ptrsize]
 
-        if pwndbg.gdblib.arch.endian == "little":
+        if pwndbg.aglib.arch.endian == "little":
             mode |= U.UC_MODE_LITTLE_ENDIAN
         else:
             mode |= U.UC_MODE_BIG_ENDIAN
@@ -219,30 +605,30 @@ class Emulator:
         page = pwndbg.lib.memory.page_align(page)
         size = pwndbg.lib.memory.PAGE_SIZE
 
-        debug("# Mapping %#x-%#x", (page, page + size))
+        debug(DEBUG_MEM_MAP, "# Mapping %#x-%#x", (page, page + size))
 
         try:
-            data = pwndbg.gdblib.memory.read(page, size)
+            data = pwndbg.aglib.memory.read(page, size)
             data = bytes(data)
-        except gdb.MemoryError:
-            debug("Could not map page %#x during emulation! [exception]", page)
+        except pwndbg.dbg_mod.Error:
+            debug(DEBUG_MEM_MAP, "Could not map page %#x during emulation! [exception]", page)
             return False
 
         if not data:
-            debug("Could not map page %#x during emulation! [no data]", page)
+            debug(DEBUG_MEM_MAP, "Could not map page %#x during emulation! [no data]", page)
             return False
 
-        debug("uc.mem_map(%(page)#x, %(size)#x)", locals())
+        debug(DEBUG_MEM_MAP, "uc.mem_map(%(page)#x, %(size)#x)", locals())
         self.uc.mem_map(page, size)
 
-        debug("# Writing %#x bytes", len(data))
-        debug("uc.mem_write(%(page)#x, ...)", locals())
+        debug(DEBUG_MEM_MAP, "# Writing %#x bytes", len(data))
+        debug(DEBUG_MEM_MAP, "uc.mem_write(%(page)#x, ...)", locals())
         self.uc.mem_write(page, data)
 
         return True
 
     def hook_mem_invalid(self, uc, access, address, size: int, value, user_data) -> bool:
-        debug("# Invalid access at %#x", address)
+        debug(DEBUG_MEM_MAP, "# Invalid access at %#x, attempting to map the page", address)
 
         # Page-align the start address
         start = pwndbg.lib.memory.page_align(address)
@@ -264,10 +650,11 @@ class Emulator:
         """
         We never want to emulate through an interrupt.  Just stop.
         """
-        debug("Got an interrupt")
+        debug(DEBUG_INTERRUPT, "Got an interrupt - %d", intno)
+        self.valid = False
         self.uc.emu_stop()
 
-    def get_reg_enum(self, reg):
+    def get_reg_enum(self, reg: str) -> int | None:
         """
         Returns the Unicorn Emulator enum code for the named register.
 
@@ -281,10 +668,10 @@ class Emulator:
         #
         #  'eax' ==> enum
         #
-        if reg in self.regs.all:
-            e = self.const_regs.get(reg.upper(), None)
-            if e is not None:
-                return e
+        # if reg in self.regs.all:
+        e = self.const_regs.get(reg.upper(), None)
+        if e is not None:
+            return e
 
         # If we're looking for an abstract register which *is* accounted for,
         # we can also do an indirect lookup.
@@ -306,33 +693,44 @@ class Emulator:
 
     def hook_add(self, *a, **kw):
         rv = self.uc.hook_add(*a, **kw)
-        debug("%r = uc.hook_add(*%r, **%r)", (rv, a, kw))
+        debug(DEBUG_HOOK_CHANGE, "%r = uc.hook_add(*%r, **%r)", (rv, a, kw))
         return rv
 
     def hook_del(self, *a, **kw):
-        debug("uc.hook_del(*%r, **%r)", (a, kw))
+        debug(DEBUG_HOOK_CHANGE, "uc.hook_del(*%r, **%r)", (a, kw))
         return self.uc.hook_del(*a, **kw)
 
+    # Can throw a UcError(status)
     def emu_start(self, *a, **kw):
-        debug("uc.emu_start(*%r, **%r)", (a, kw))
+        debug(DEBUG_EMU_START_STOP, "uc.emu_start(*%r, **%r)", (a, kw))
         return self.uc.emu_start(*a, **kw)
 
     def emu_stop(self, *a, **kw):
-        debug("uc.emu_stop(*%r, **%r)", (a, kw))
+        debug(DEBUG_EMU_START_STOP, "uc.emu_stop(*%r, **%r)", (a, kw))
         return self.uc.emu_stop(*a, **kw)
 
     def emulate_with_hook(self, hook, count=512) -> None:
         ident = self.hook_add(U.UC_HOOK_CODE, hook)
+
+        pc: int = self.pc
+        # Unicorn appears to disregard the UC_MODE_THUMB mode passed into the constructor, and instead
+        # determines Thumb mode based on the PC that is passed to the `emu_start` function
+        # https://github.com/unicorn-engine/unicorn/issues/391
+        #
+        # Because we single-step the emulator, we always have to read the Thumb bit from the emulator
+        # and set the least significant bit of the PC to 1 if the bit is 1 in order to enable Thumb mode
+        # for the execution of the next instruction. If this `emulate_with_hook` executes multiple instructions
+        # which have Thumb mode transitions, Unicorn will internally handle them.
+        pc |= self.read_thumb_bit()
+
         try:
-            self.emu_start(self.pc, 0, count=count)
+            self.emu_start(pc, 0, count=count)
         finally:
             self.hook_del(ident)
 
     def mem_read(self, *a, **kw):
-        debug("uc.mem_read(*%r, **%r)", (a, kw))
+        debug(DEBUG_MEM_READ, "uc.mem_read(*%r, **%r)", (a, kw))
         return self.uc.mem_read(*a, **kw)
-
-    jump_types = {C.CS_GRP_CALL, C.CS_GRP_JUMP, C.CS_GRP_RET}
 
     def until_jump(self, pc=None):
         """
@@ -365,7 +763,7 @@ class Emulator:
         self._prev_size = None
         self._curr = None
 
-        # Add the single-step hook, start emulating, and remove the hook.
+        # Add the jump hook, start emulating, and remove the hook.
         self.emulate_with_hook(self.until_jump_hook_code)
 
         # We're done emulating
@@ -385,7 +783,7 @@ class Emulator:
         # The previous instruction does not immediately precede this one.
         else:
             self._curr = address
-            debug("%#x %#X --> %#x", (self._prev, self._prev_size, self._curr))
+            debug(DEBUG_EXECUTING, "%#x %#X --> %#x", (self._prev, self._prev_size, self._curr))
             self.emu_stop()
             return
 
@@ -395,7 +793,7 @@ class Emulator:
     def until_call(self, pc=None):
         addr, target = self.until_jump(pc)
 
-        while target and C.CS_GRP_CALL not in pwndbg.disasm.one(addr).groups:
+        while target and not pwndbg.aglib.disasm.one_raw(addr).call_like:
             addr, target = self.until_jump(target)
 
         return addr, target
@@ -411,37 +809,59 @@ class Emulator:
 
     def until_syscall_hook_code(self, uc, address, size: int, user_data) -> None:
         data = binascii.hexlify(self.mem_read(address, size))
-        debug("# Executing instruction at %(address)#x with bytes %(data)s", locals())
+        debug(
+            DEBUG_EXECUTING, "# Executing instruction at %(address)#x with bytes %(data)s", locals()
+        )
         self.until_syscall_address = address
 
-    def single_step(self, pc=None):
+    def single_step(self, pc=None) -> Tuple[int, int]:
         """Steps one instruction.
 
         Yields:
-            Each iteration, yields a tuple of (address, instruction_size).=
+            Each iteration, yields a tuple of (address_just_executed, instruction_size).
 
-            A StopIteration is raised if a fault or syscall or call instruction
-            is encountered.
+            Returns (None, None) upon failure to execute the instruction
         """
-        self._single_step = (None, None)
+
+        # If the emulator has been manually marked as invalid, we should no longer step it
+        if not self.valid:
+            return InstructionExecutedResult(None, None)
+
+        self.last_single_step_result = InstructionExecutedResult(None, None)
 
         pc = pc or self.pc
-        insn = pwndbg.disasm.one(pc)
+
+        insn = pwndbg.aglib.disasm.one_raw(pc)
 
         # If we don't know how to disassemble, bail.
         if insn is None:
-            debug("Can't disassemble instruction at %#x", pc)
-            return self._single_step
+            debug(DEBUG_EXECUTING, "Can't disassemble instruction at %#x", pc)
+            return self.last_single_step_result
 
-        debug("# Single-stepping at %#x: %s %s", (pc, insn.mnemonic, insn.op_str))
+        if insn.id in BANNED_INSTRUCTIONS.get(self.arch, {}):
+            debug(DEBUG_EXECUTING, "Hit illegal instruction at %#x", pc)
+            return self.last_single_step_result
+
+        debug(
+            DEBUG_EXECUTING,
+            "# Emulator attempting to single-step at %#x: %s %s",
+            (pc, insn.mnemonic, insn.op_str),
+        )
 
         try:
             self.single_step_hook_hit_count = 0
             self.emulate_with_hook(self.single_step_hook_code, count=1)
-        except U.unicorn.UcError as e:
-            self._single_step = (None, None)
+            if not self.valid:
+                return InstructionExecutedResult(None, None)
 
-        return self._single_step
+            # If above call does not throw an Exception, we successfully executed the instruction
+            self.last_pc = pc
+            debug(DEBUG_EXECUTING, "Unicorn now at pc=%#x", self.pc)
+        except U.unicorn.UcError:
+            debug(DEBUG_EXECUTING, "Emulator failed to execute instruction")
+            self.last_single_step_result = InstructionExecutedResult(None, None)
+
+        return self.last_single_step_result
 
     def single_step_iter(self, pc=None):
         a = self.single_step(pc)
@@ -450,15 +870,18 @@ class Emulator:
             yield a
             a = self.single_step(pc)
 
-    def single_step_hook_code(self, _uc, address, instruction_size: int, _user_data) -> None:
+    # Whenever Unicorn is "about to execute" an instruction, this hook is called
+    # https://github.com/unicorn-engine/unicorn/issues/1434
+    def single_step_hook_code(self, _uc, address: int, instruction_size: int, _user_data) -> None:
         # For whatever reason, the hook will hit twice on
         # unicorn >= 1.0.2rc4, but not on unicorn-1.0.2rc1~unicorn-1.0.2rc3,
         # So we use a counter to ensure the code run only once
         if self.single_step_hook_hit_count == 0:
-            debug("# single_step: %#-8x", address)
-            self._single_step = (address, instruction_size)
+            debug(DEBUG_EXECUTING, "# single_step: %#-8x", address)
+            self.last_single_step_result = InstructionExecutedResult(address, instruction_size)
             self.single_step_hook_hit_count += 1
 
+    # For debugging
     def dumpregs(self) -> None:
         for reg in (
             list(self.regs.retaddr)
@@ -469,13 +892,16 @@ class Emulator:
             enum = self.get_reg_enum(reg)
 
             if not reg or enum is None:
-                debug("# Could not dump register %r", reg)
+                print("# Could not dump register %r" % (reg,))
                 continue
 
             name = f"U.x86_const.UC_X86_REG_{reg.upper()}"
             value = self.uc.reg_read(enum)
-            debug("uc.reg_read(%(name)s) ==> %(value)x", locals())
+            print("uc.reg_read(%s) ==> %x" % (name, value))
 
     def trace_hook(self, _uc, address, instruction_size: int, _user_data) -> None:
         data = binascii.hexlify(self.mem_read(address, instruction_size))
-        debug("# trace_hook: %#-8x %r", (address, data))
+        debug(DEBUG_TRACE, "# trace_hook: %#-8x %r", (address, data))
+
+    def __repr__(self) -> str:
+        return f"Valid: {self.valid}, PC: {self.pc:#x}"

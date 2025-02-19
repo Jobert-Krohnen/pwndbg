@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 import string
+from typing import Optional
 
-import gdb
 from pwnlib.util.cyclic import cyclic
 from pwnlib.util.cyclic import cyclic_find
 
+import pwndbg.aglib.arch
 import pwndbg.commands
-import pwndbg.gdblib.arch
 from pwndbg.color import message
 
 parser = argparse.ArgumentParser(description="Cyclic pattern creator/finder.")
@@ -30,6 +30,7 @@ parser.add_argument(
     help="Size of the unique subsequences (defaults to the pointer size for the current arch)",
 )
 
+
 group = parser.add_mutually_exclusive_group(required=False)
 group.add_argument(
     "-l",
@@ -50,20 +51,25 @@ group.add_argument(
     help="Number of characters to print from the sequence (default: print the entire sequence)",
 )
 
+parser.add_argument(
+    "filename",
+    type=str,
+    help="Name (path) of the file to save the cyclic pattern to",
+    default="",
+    nargs="?",
+)
+
 
 @pwndbg.commands.ArgparsedCommand(parser, command_name="cyclic")
-def cyclic_cmd(alphabet, length, lookup, count=100) -> None:
-    if length:
-        # Convert from gdb.Value
-        length = int(length)
-    else:
-        length = pwndbg.gdblib.arch.ptrsize
+def cyclic_cmd(alphabet, length: Optional[int], lookup, count=100, filename="") -> None:
+    if length is None:
+        length = pwndbg.aglib.arch.ptrsize
 
     if lookup:
         lookup = pwndbg.commands.fix(lookup, sloppy=True)
 
-        if isinstance(lookup, (gdb.Value, int)):
-            lookup = int(lookup).to_bytes(length, pwndbg.gdblib.arch.endian)
+        if isinstance(lookup, (pwndbg.dbg_mod.Value, int)):
+            lookup = int(lookup).to_bytes(length, pwndbg.aglib.arch.endian)
         elif isinstance(lookup, str):
             lookup = bytes(lookup, "utf-8")
 
@@ -93,5 +99,12 @@ def cyclic_cmd(alphabet, length, lookup, count=100) -> None:
         else:
             print(message.success(f"Found at offset {offset}"))
     else:
-        sequence = cyclic(int(count), alphabet, length)
-        print(sequence.decode())
+        count = int(count)
+        sequence = cyclic(count, alphabet, length)
+
+        if not filename:
+            print(sequence.decode())
+        else:
+            with open(filename, "wb") as f:
+                f.write(sequence)
+                print(f"Written a cyclic sequence of length {count} to file {filename}")

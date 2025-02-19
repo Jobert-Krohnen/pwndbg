@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 
-import pwndbg.gdblib.arch
+import pwndbg.aglib.arch
 
 PAGE_SIZE = 0x1000
 PAGE_MASK = ~(PAGE_SIZE - 1)
@@ -48,11 +48,6 @@ def page_offset(address: int) -> int:
     return address & (PAGE_SIZE - 1)
 
 
-# TODO: Move to a test
-assert round_down(0xDEADBEEF, 0x1000) == 0xDEADB000
-assert round_up(0xDEADBEEF, 0x1000) == 0xDEADC000
-
-
 class Page:
     """
     Represents the address space and page permissions of at least
@@ -64,6 +59,12 @@ class Page:
     flags = 0  #: Flags set by the ELF file, see PF_X, PF_R, PF_W
     offset = 0  #: Offset into the original ELF file that the data is loaded from
     objfile = ""  #: Path to the ELF on disk
+    """
+    Possible non-empty values of `objfile`:
+    - Contains square brackets "[]" if it's not a memory mapped file.
+        Examples: [stack], [vsyscall], [heap], [vdso]
+    - A path to a file, such as `/usr/lib/libc.so.6`
+    """
 
     def __init__(self, start: int, size: int, flags: int, offset: int, objfile: str = "") -> None:
         self.vaddr = start
@@ -92,7 +93,7 @@ class Page:
 
     @property
     def is_stack(self) -> bool:
-        return self.objfile == "[stack]"
+        return self.objfile.startswith("[stack")
 
     @property
     def is_memory_mapped_file(self) -> bool:
@@ -115,8 +116,16 @@ class Page:
         return self.read and self.write
 
     @property
+    def wx(self) -> bool:
+        return self.write and self.execute
+
+    @property
     def rwx(self) -> bool:
         return self.read and self.write and self.execute
+
+    @property
+    def is_guard(self) -> bool:
+        return not (self.read or self.write or self.execute)
 
     @property
     def permstr(self) -> str:
@@ -131,7 +140,7 @@ class Page:
         )
 
     def __str__(self) -> str:
-        return f"{self.vaddr:#{2 + 2 * pwndbg.gdblib.arch.ptrsize}x} {self.vaddr + self.memsz:#{2 + 2 * pwndbg.gdblib.arch.ptrsize}x} {self.permstr} {self.memsz:8x} {self.offset:6x} {self.objfile or ''}"
+        return f"{self.vaddr:#{2 + 2 * pwndbg.aglib.arch.ptrsize}x} {self.vaddr + self.memsz:#{2 + 2 * pwndbg.aglib.arch.ptrsize}x} {self.permstr} {self.memsz:8x} {self.offset:6x} {self.objfile or ''}"
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.__str__()!r})"
@@ -139,11 +148,11 @@ class Page:
     def __contains__(self, addr: int) -> bool:
         return self.start <= addr < self.end
 
-    def __eq__(self, other) -> bool:
+    def __eq__(self, other: object) -> bool:
         return self.vaddr == getattr(other, "vaddr", other)
 
-    def __lt__(self, other) -> bool:
-        return self.vaddr < getattr(other, "vaddr", other)
+    def __lt__(self, other: object) -> bool:
+        return self.vaddr < getattr(other, "vaddr", other)  # type: ignore[arg-type]
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash((self.vaddr, self.memsz, self.flags, self.offset, self.objfile))

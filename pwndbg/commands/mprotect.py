@@ -2,18 +2,15 @@ from __future__ import annotations
 
 import argparse
 
-import gdb
-import pwnlib
-from pwnlib import asm
-
+import pwndbg.aglib.file
+import pwndbg.aglib.shellcode
 import pwndbg.chain
 import pwndbg.commands
 import pwndbg.enhance
-import pwndbg.gdblib.file
+import pwndbg.lib.memory
 import pwndbg.wrappers.checksec
 import pwndbg.wrappers.readelf
 from pwndbg.commands import CommandCategory
-from pwndbg.lib.regs import reg_sets
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -26,6 +23,8 @@ can be decoded with the `errno <value>` command.
 
 Examples:
     mprotect $rsp 4096 PROT_READ|PROT_WRITE|PROT_EXEC
+    mprotect $rsp 4096 rwx
+    mprotect $rsp 4096 7
     mprotect some_symbol 0x1000 PROT_NONE
 """,
 )
@@ -34,11 +33,11 @@ parser.add_argument(
 )
 parser.add_argument(
     "length",
-    help="Count of bytes to call mprotect on. Needs " "to be multiple of page size.",
+    help="Count of bytes to call mprotect on. Needs to be multiple of page size.",
     type=int,
 )
 parser.add_argument(
-    "prot", help="Prot string as in mprotect(2). Eg. " '"PROT_READ|PROT_EXEC"', type=str
+    "prot", help='Prot string as in mprotect(2). Eg. "PROT_READ|PROT_EXEC", "rx", or "5"', type=str
 )
 
 SYS_MPROTECT = 0x7D
@@ -51,52 +50,62 @@ prot_dict = {
 }
 
 
-def prot_str_to_val(protstr):
-    """Heuristic to convert PROT_EXEC|PROT_WRITE to integer value."""
-    prot_int = 0
+def prot_str_to_val(protstr: str) -> int:
+    """
+    Converts a protection string to an integer. Formats include:
+     - A positive integer, like 3
+     - A combination of r, w, and x, like rw
+     - A combination of PROT_READ, PROT_WRITE, and PROT_EXEC, like PROT_READ|PROT_WRITE
+    """
+    protstr = protstr.upper()
+    if "PROT" in protstr:
+        prot_int = 0
+        for k, v in prot_dict.items():
+            if k in protstr:
+                prot_int |= v
+        return prot_int
+    elif all(x in "RWX" for x in protstr):
+        prot_int = 0
+        for c in protstr:
+            if c == "R":
+                prot_int |= 1
+            elif c == "W":
+                prot_int |= 2
+            elif c == "X":
+                prot_int |= 4
+        return prot_int
+    else:
+        try:
+            return int(protstr, 0)
+        except ValueError:
+            raise ValueError("Invalid protection string passed into mprotect")
+
+
+def prot_val_to_str(protval: int) -> str:
+    if protval == 0:
+        return "PROT_NONE"
+    ret = []
     for k, v in prot_dict.items():
-        if k in protstr:
-            prot_int |= v
-    return prot_int
+        if protval & v:
+            ret.append(k)
+    return "|".join(ret)
 
 
 @pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.MEMORY)
 @pwndbg.commands.OnlyWhenRunning
 def mprotect(addr, length, prot) -> None:
     prot_int = prot_str_to_val(prot)
+    orig_addr = int(addr)
+    aligned = pwndbg.lib.memory.page_align(orig_addr)
 
-    # generate a shellcode that executes the mprotect syscall
-    shellcode_asm = pwnlib.shellcraft.syscall(
-        "SYS_mprotect", int(pwndbg.lib.memory.page_align(addr)), int(length), int(prot_int)
-    )
-    shellcode = asm.asm(shellcode_asm)
+    async def ctrl(ec: pwndbg.dbg_mod.ExecutionController):
+        print(
+            f"calling mprotect on address {aligned:#x} with protection {prot_int} ({prot_val_to_str(prot_int)})"
+        )
 
-    # obtain the registers that need to be saved for the current platform
-    # we save the registers that are used for arguments, return value and the program counter
-    current_regs = reg_sets[pwndbg.gdblib.arch.current]
-    regs_to_save = current_regs.args + (current_regs.retval, current_regs.pc)
+        ret = await pwndbg.aglib.shellcode.exec_syscall(
+            ec, "SYS_mprotect", aligned, int(length) + orig_addr - aligned, int(prot_int)
+        )
+        print(f"mprotect returned {ret}")
 
-    # save the registers
-    saved_registers = {reg: pwndbg.gdblib.regs[reg] for reg in regs_to_save}
-
-    # save the memory which will be overwritten by the shellcode
-    saved_instruction_bytes = pwndbg.gdblib.memory.read(
-        saved_registers[current_regs.pc], len(shellcode)
-    )
-    pwndbg.gdblib.memory.write(saved_registers[current_regs.pc], shellcode)
-
-    # execute syscall
-    gdb.execute("nextsyscall")
-    gdb.execute("stepi")
-
-    # get the return value
-    ret = pwndbg.gdblib.regs[current_regs.retval]
-
-    print("mprotect returned %d (%s)" % (ret, current_regs.retval))
-
-    # restore registers and memory
-    pwndbg.gdblib.memory.write(saved_registers[current_regs.pc], saved_instruction_bytes)
-
-    # restore the registers
-    for register, value in saved_registers.items():
-        setattr(pwndbg.gdblib.regs, register, value)
+    pwndbg.dbg.selected_inferior().dispatch_execution_controller(ctrl)
