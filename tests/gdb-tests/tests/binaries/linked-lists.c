@@ -1,12 +1,15 @@
 #include <stddef.h> /* For NULL. */
 
-/* Linked list in which the pointer to the next element in inside the node 
+/* Linked list in which the pointer to the next element in inside the node
  * structure itself. */
 struct node {
     int value;
     struct node *next;
 };
-struct node node_c = { 2, NULL };
+struct node node_f = { 5, NULL };
+struct node node_e = { 4, &node_f };
+struct node node_d = { 3, &node_e };
+struct node node_c = { 2, &node_d };
 struct node node_b = { 1, &node_c };
 struct node node_a = { 0, &node_b };
 
@@ -22,7 +25,7 @@ struct inner_a_node inner_a_node_c = { 2, { NULL } };
 struct inner_a_node inner_a_node_b = { 1, { &inner_a_node_c.inner } };
 struct inner_a_node inner_a_node_a = { 0, { &inner_a_node_b.inner } };
 
-/* Linked list in which the pointer to the next element is nested inside the 
+/* Linked list in which the pointer to the next element is nested inside the
  * structure. */
 struct inner_b_node;
 struct node_inner_b {

@@ -4,15 +4,23 @@ Search the address space for byte patterns.
 
 from __future__ import annotations
 
-import gdb
+from typing import Collection
+from typing import Generator
 
-import pwndbg.gdblib.arch
-import pwndbg.gdblib.memory
-import pwndbg.gdblib.typeinfo
-import pwndbg.gdblib.vmmap
+import pwndbg.aglib.vmmap
 
 
-def search(searchfor, mappings=None, start=None, end=None, executable=False, writable=False):
+def search(
+    searchfor: bytes,
+    mappings: Collection[pwndbg.lib.memory.Page] | None = None,
+    start: int | None = None,
+    end: int | None = None,
+    step: int | None = None,
+    aligned: int | None = None,
+    limit: int | None = None,
+    executable: bool = False,
+    writable: bool = False,
+) -> Generator[int, None, None]:
     """Search inferior memory for a byte sequence.
 
     Arguments:
@@ -21,15 +29,18 @@ def search(searchfor, mappings=None, start=None, end=None, executable=False, wri
             By default, uses all available mappings.
         start(int): First address to search, inclusive.
         end(int): Last address to search, exclusive.
+        step(int): Size of memory region to skip each result
+        aligned(int): Strict byte alignment for search result
+        limit(int): Maximum number of results to return
         executable(bool): Restrict search to executable pages
         writable(bool): Restrict search to writable pages
 
     Yields:
         An iterator on the address matches
     """
-    i = gdb.selected_inferior()
+    i = pwndbg.dbg.selected_inferior()
 
-    maps = mappings or pwndbg.gdblib.vmmap.get()
+    maps = mappings or pwndbg.aglib.vmmap.get()
 
     if end and start:
         assert start < end, "Last address to search must be greater then first address"
@@ -37,7 +48,7 @@ def search(searchfor, mappings=None, start=None, end=None, executable=False, wri
     elif start:
         maps = [m for m in maps if start in m]
     elif end:
-        maps = [m for m in maps if end - 1 in m]
+        maps = [m for m in maps if (end - 1) in m]
 
     if executable:
         maps = [m for m in maps if m.execute]
@@ -45,32 +56,28 @@ def search(searchfor, mappings=None, start=None, end=None, executable=False, wri
     if writable:
         maps = [m for m in maps if m.write]
 
+    if len(maps) == 0:
+        print("No applicable memory regions found to search in.")
+        return
+
+    count = 0
+    if limit and limit <= 0:
+        return
+
     for vmmap in maps:
         start = vmmap.start
         end = vmmap.end
 
-        while True:
-            # No point in searching if we can't read the memory
-            if not pwndbg.gdblib.memory.peek(start):
-                break
+        if limit and count >= limit:
+            break
 
-            length = end - start
-            if length <= 0:
-                break
-
-            start = i.search_memory(start, length, searchfor)
-
-            if start is None:
-                break
-
-            # Fix bug: In kernel mode, search_memory may return a negative address,
-            # e.g. -1073733344, which supposed to be 0xffffffffc0002120 in kernel.
-            start &= 0xFFFFFFFFFFFFFFFF
-
-            # For some reason, search_memory will return a positive hit
-            # when it's unable to read memory.
-            if not pwndbg.gdblib.memory.peek(start):
-                break
-
-            yield start
-            start += len(searchfor)
+        for element in i.find_in_memory(
+            bytearray(searchfor),
+            start,
+            end - start,
+            aligned or 1,
+            (limit - count) if limit else -1,
+            step or -1,
+        ):
+            yield element
+            count += 1

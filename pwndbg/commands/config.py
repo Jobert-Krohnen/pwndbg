@@ -6,20 +6,32 @@ from __future__ import annotations
 
 import argparse
 
+import pwndbg
 import pwndbg.commands
-import pwndbg.gdblib.config
+import pwndbg.lib.config
 from pwndbg.color import generateColorFunction
 from pwndbg.color import ljust_colored
 from pwndbg.color import strip
 from pwndbg.color.message import hint
 from pwndbg.commands import CommandCategory
 
+if pwndbg.dbg.is_gdblib_available():
+    import pwndbg.gdblib.config
 
-def print_row(name, value, default, set_show_doc, ljust_optname, ljust_value, empty_space=6):
+
+def print_row(
+    name: str,
+    value: str,
+    default: str,
+    set_show_doc: str,
+    ljust_optname: int,
+    ljust_value: int,
+    empty_space: int = 6,
+):
     name = ljust_colored(name, ljust_optname + empty_space)
     defval = extend_value_with_default(value, default)
     defval = ljust_colored(defval, ljust_value + empty_space)
-    result = " ".join((name, defval, set_show_doc))
+    result = f"{name} {defval} {set_show_doc}"
     print(result)
     return result
 
@@ -33,7 +45,7 @@ def extend_value_with_default(value, default):
 def get_config_parameters(scope, filter_pattern):
     values = [
         v
-        for k, v in pwndbg.gdblib.config.params.items()
+        for k, v in pwndbg.config.params.items()
         if isinstance(v, pwndbg.lib.config.Parameter) and v.scope == scope
     ]
 
@@ -65,14 +77,14 @@ def display_config(filter_pattern: str, scope: str, has_file_command: bool = Tru
         print(hint(f'No {scope} parameter found with filter "{filter_pattern}"'))
         return
 
-    longest_optname = max(map(len, [v.name for v in values]))
+    longest_optname = max(map(len, (v.name for v in values)))
     longest_value = max(
         # We use `repr` here so the string values will be in quotes
-        map(len, [extend_value_with_default(repr(v.value), repr(v.default)) for v in values])
+        map(len, (extend_value_with_default(repr(v.value), repr(v.default)) for v in values))
     )
 
     header = print_row("Name", "Value", "Default", "Documentation", longest_optname, longest_value)
-    print("-" * (len(header)))
+    print("-" * len(header))
 
     for v in sorted(values):
         if isinstance(v, pwndbg.color.theme.ColorParameter):
@@ -81,6 +93,10 @@ def display_config(filter_pattern: str, scope: str, has_file_command: bool = Tru
 
             value = generateColorFunction(v.value)(v.value)
             default = generateColorFunction(v.default)(v.default)
+        elif isinstance(v.value, bool):
+            # Display 'on' or 'off' - same as GDB parameter display
+            value = "on" if v.value else "off"
+            default = "on" if v.default else "off"
         else:
             value = repr(v.value)
             default = repr(v.default)
@@ -124,9 +140,11 @@ def theme(filter_pattern) -> None:
     display_config(filter_pattern, "theme")
 
 
-@pwndbg.commands.ArgparsedCommand(configfile_parser, category=CommandCategory.PWNDBG)
-def configfile(show_all=False) -> None:
-    configfile_print_scope("config", show_all)
+if pwndbg.dbg.is_gdblib_available():
+
+    @pwndbg.commands.ArgparsedCommand(configfile_parser, category=CommandCategory.PWNDBG)
+    def configfile(show_all=False) -> None:
+        configfile_print_scope("config", show_all)
 
 
 themefile_parser = argparse.ArgumentParser(
@@ -137,13 +155,15 @@ themefile_parser.add_argument(
 )
 
 
-@pwndbg.commands.ArgparsedCommand(themefile_parser, category=CommandCategory.PWNDBG)
-def themefile(show_all=False) -> None:
-    configfile_print_scope("theme", show_all)
+if pwndbg.dbg.is_gdblib_available():
+
+    @pwndbg.commands.ArgparsedCommand(themefile_parser, category=CommandCategory.PWNDBG)
+    def themefile(show_all=False) -> None:
+        configfile_print_scope("theme", show_all)
 
 
-def configfile_print_scope(scope, show_all=False) -> None:
-    params = pwndbg.gdblib.config.get_params(scope)
+def configfile_print_scope(scope: str, show_all: bool = False) -> None:
+    params = pwndbg.config.get_params(scope)
 
     if not show_all:
         params = list(filter(lambda p: p.is_changed, params))
@@ -153,10 +173,10 @@ def configfile_print_scope(scope, show_all=False) -> None:
             print(hint("Showing only changed values:"))
         for p in params:
             native_default = pwndbg.gdblib.config_mod.Parameter._value_to_gdb_native(
-                p.default, param_class=p.param_class
+                p.default, param_class=pwndbg.gdblib.config.CLASS_MAPPING[p.param_class]
             )
             native_value = pwndbg.gdblib.config_mod.Parameter._value_to_gdb_native(
-                p.value, param_class=p.param_class
+                p.value, param_class=pwndbg.gdblib.config.CLASS_MAPPING[p.param_class]
             )
             print(f"# {p.name}: {p.set_show_doc}")
             print(f"# default: {native_default}")

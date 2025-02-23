@@ -2,43 +2,48 @@ from __future__ import annotations
 
 import argparse
 
+import pwndbg.aglib.kernel
 import pwndbg.color.message as M
 import pwndbg.commands
-import pwndbg.gdblib.memory
-import pwndbg.gdblib.vmmap
+import pwndbg.dbg
+from pwndbg import config
 from pwndbg.commands import CommandCategory
-from pwndbg.gdblib.config import config
+
+if pwndbg.dbg.is_gdblib_available():
+    import gdb
+
 
 parser = argparse.ArgumentParser(description="Finds the kernel virtual base address.")
+
+parser.add_argument("-r", "--rebase", action="store_true", help="rebase loaded symbol file")
 
 
 @pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.KERNEL)
 @pwndbg.commands.OnlyWhenQemuKernel
 @pwndbg.commands.OnlyWhenPagingEnabled
-def kbase() -> None:
+def kbase(rebase=False) -> None:
     if config.kernel_vmmap == "none":
         print(M.error("kbase does not work when kernel-vmmap is set to none"))
         return
 
-    arch_name = pwndbg.gdblib.arch.name
-    if arch_name == "x86-64":
-        # First opcode, seems to be consistent
-        magic = 0x48
-    elif arch_name == "aarch64":
-        # First byte of "MZ" header
-        magic = 0x4D
-    else:
-        print(M.error(f"kbase does not support the {arch_name} architecture"))
+    base = pwndbg.aglib.kernel.kbase()
+
+    if base is None:
+        print(M.error("Unable to locate the kernel base"))
         return
 
-    mappings = pwndbg.gdblib.vmmap.get()
-    for mapping in mappings:
-        # TODO: Check alignment
-        # TODO: Check if the supervisor bit is set for aarch64
-        if not mapping.execute:
-            continue
-        b = pwndbg.gdblib.memory.byte(mapping.vaddr)
+    print(M.success(f"Found virtual text base address: {hex(base)}"))
 
-        if b == magic:
-            print(M.success(f"Found virtual base address: {mapping.vaddr:#x}"))
-            break
+    if not rebase:
+        return
+
+    symbol_file = pwndbg.dbg.selected_inferior().main_module_name()
+
+    if symbol_file:
+        if pwndbg.dbg.is_gdblib_available():
+            gdb.execute("symbol-file")
+            gdb.execute(f"add-symbol-file {symbol_file} {hex(base)}")
+        else:
+            print(M.error("Adding symbol not supported in LLDB yet"))
+    else:
+        print(M.error("No symbol file is currently loaded"))

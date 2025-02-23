@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import argparse
 
-import pwndbg.gdblib.nearpc
+import pwndbg.aglib.nearpc
 from pwndbg.commands import CommandCategory
 
 parser = argparse.ArgumentParser(description="Disassemble near a specified address.")
-parser.add_argument("pc", type=int, nargs="?", default=None, help="Address to disassemble near.")
+parser.add_argument(
+    "pc",
+    type=int,
+    nargs="?",
+    default=None,
+    help="Address to disassemble near. If this is the only argument and the value provided is small enough, it is interpreted as lines instead.",
+)
 parser.add_argument(
     "lines",
     type=int,
@@ -24,11 +30,17 @@ parser.add_argument(
 
 @pwndbg.commands.ArgparsedCommand(parser, aliases=["pdisass", "u"], category=CommandCategory.DISASS)
 @pwndbg.commands.OnlyWhenRunning
-def nearpc(pc=None, lines=None, emulate=False) -> None:
+def nearpc(pc=None, lines=None, emulate=False, use_cache=False, linear=True) -> None:
     """
     Disassemble near a specified address.
     """
-    print("\n".join(pwndbg.gdblib.nearpc.nearpc(pc, lines, emulate, nearpc.repeat)))
+    print(
+        "\n".join(
+            pwndbg.aglib.nearpc.nearpc(
+                pc, lines, emulate, nearpc.repeat, use_cache=use_cache, linear=linear
+            )
+        )
+    )
 
 
 parser = argparse.ArgumentParser(
@@ -51,4 +63,4 @@ def emulate(pc=None, lines=None, emulate_=True) -> None:
     Like nearpc, but will emulate instructions from the current $PC forward.
     """
     nearpc.repeat = emulate.repeat
-    nearpc(pc, lines, emulate_)
+    nearpc(pc, lines, emulate_, use_cache=True, linear=False)

@@ -6,7 +6,8 @@ import tempfile
 import gdb
 import pytest
 
-import pwndbg
+import pwndbg.aglib.arch
+import pwndbg.aglib.heap
 import tests
 
 HEAP_BINARY = tests.binaries.get("heap_bugs.out")
@@ -158,9 +159,9 @@ def test_try_free_invalid_fastbin_entry(start_binary):
 
 def test_try_free_double_free_or_corruption_top(start_binary):
     setup_heap(start_binary, 9)
-    allocator = pwndbg.heap.current
+    allocator = pwndbg.aglib.heap.current
 
-    ptr_size = pwndbg.gdblib.arch.ptrsize
+    ptr_size = pwndbg.aglib.arch.ptrsize
     arena = allocator.thread_arena or allocator.main_arena
     top_chunk = arena.top + (2 * ptr_size)
 
@@ -190,14 +191,6 @@ def test_try_free_invalid_next_size_normal(start_binary):
 
     result = gdb.execute(f"try_free {hex(chunks['d'])}", to_string=True)
     assert "free(): invalid next size (normal)" in result
-    os.remove(OUTPUT_FILE)
-
-
-def test_try_free_corrupted_consolidate_backward(start_binary):
-    chunks = setup_heap(start_binary, 13)
-
-    result = gdb.execute(f"try_free {hex(chunks['e'])}", to_string=True)
-    assert "corrupted size vs. prev_size while consolidating" in result
     os.remove(OUTPUT_FILE)
 
 

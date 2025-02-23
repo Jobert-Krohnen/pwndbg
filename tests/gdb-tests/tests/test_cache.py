@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import pwndbg
 import tests
+from pwndbg.dbg import EventType
 from pwndbg.lib import cache
 
 BINARY = tests.binaries.get("reference-binary.out")
@@ -68,3 +70,28 @@ def test_cache_args_kwargs_properly(start_binary):
 
     assert foo("abc") == (5, "abc", (), {}) and x == 5
     assert foo(100, 200) == (6, 100, (200,), {}) and x == 6
+
+
+def test_cache_clear_has_priority(start_binary):
+    actions = []
+
+    @pwndbg.dbg.event_handler(EventType.STOP)
+    def on_stop():
+        actions.append("on_stop")
+        # test to make sure event handlers don't have a stale cache
+        foo()
+
+    @cache.cache_until("stop")
+    def foo():
+        actions.append("foo")
+
+    foo()
+    foo()
+    assert actions == ["foo"]
+
+    start_binary(BINARY)
+    assert actions == ["foo", "on_stop", "foo"]
+
+    foo()
+    foo()
+    assert actions == ["foo", "on_stop", "foo"]

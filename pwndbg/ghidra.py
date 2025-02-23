@@ -2,21 +2,25 @@ from __future__ import annotations
 
 import os
 
-import gdb
-
+import pwndbg.aglib.proc
+import pwndbg.aglib.regs
 import pwndbg.color.context as C
 import pwndbg.color.syntax_highlight as H
-import pwndbg.gdblib.regs
+import pwndbg.dbg
 import pwndbg.radare2
 import pwndbg.rizin
+
+if pwndbg.dbg.is_gdblib_available():
+    import pwndbg.gdblib.symbol
+
 from pwndbg.color import message
 
-r2decompiler = pwndbg.gdblib.config.add_param(
+r2decompiler = pwndbg.config.add_param(
     "r2decompiler", "radare2", "framework that your ghidra plugin installed (radare2/rizin)"
 )
 
 
-@pwndbg.gdblib.config.trigger(r2decompiler)
+@pwndbg.config.trigger(r2decompiler)
 def set_r2decompiler() -> None:
     if r2decompiler.value in ["radare2", "rizin"]:
         return
@@ -56,8 +60,8 @@ def decompile(func=None):
 
     if not func:
         func = (
-            hex(pwndbg.gdblib.regs[pwndbg.gdblib.regs.current.pc])
-            if pwndbg.gdblib.proc.alive
+            hex(pwndbg.aglib.regs[pwndbg.aglib.regs.current.pc])
+            if pwndbg.aglib.proc.alive
             else "main"
         )
 
@@ -69,8 +73,8 @@ def decompile(func=None):
     source = src.get("code", "")
 
     # If not running there is no current pc to mark
-    if pwndbg.gdblib.proc.alive:
-        pc = pwndbg.gdblib.regs[pwndbg.gdblib.regs.current.pc]
+    if pwndbg.aglib.proc.alive:
+        pc = pwndbg.aglib.regs[pwndbg.aglib.regs.current.pc]
 
         closest = 0
         for off in (a.get("offset", 0) for a in src.get("annotations", [])):
@@ -87,18 +91,20 @@ def decompile(func=None):
             source = source.split("\n")
             line = source[curline]
             if line.startswith("    "):
-                line = line[min(4, len(pwndbg.gdblib.config.code_prefix) + 1) :]
+                line = line[min(4, len(pwndbg.config.code_prefix) + 1) :]
             source[curline] = current_line_marker + " " + line
             source = "\n".join(source)
 
-    if pwndbg.gdblib.config.syntax_highlight:
+    if pwndbg.config.syntax_highlight:
         # highlighting depends on the file extension to guess the language, so try to get one...
-        src_filename = pwndbg.gdblib.symbol.selected_frame_source_absolute_filename()
+        src_filename = None
+        if pwndbg.dbg.is_gdblib_available():
+            src_filename = pwndbg.gdblib.symbol.selected_frame_source_absolute_filename()
         if not src_filename:
-            filename = gdb.current_progspace().filename
+            filename = pwndbg.dbg.selected_inferior().main_module_name()
             src_filename = filename + ".c" if os.path.basename(filename).find(".") < 0 else filename
         source = H.syntax_highlight(source, src_filename)
 
     # Replace code prefix marker after syntax highlighting
-    source = source.replace(current_line_marker, C.prefix(pwndbg.gdblib.config.code_prefix), 1)
+    source = source.replace(current_line_marker, C.prefix(pwndbg.config.code_prefix), 1)
     return source

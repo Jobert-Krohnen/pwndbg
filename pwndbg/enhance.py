@@ -10,31 +10,44 @@ supplemental information sources (e.g. active IDA Pro connection).
 from __future__ import annotations
 
 import string
+from typing import Tuple
 
+import pwndbg
+import pwndbg.aglib.arch
+import pwndbg.aglib.disasm
+import pwndbg.aglib.memory
+import pwndbg.aglib.strings
+import pwndbg.aglib.typeinfo
+import pwndbg.aglib.vmmap
 import pwndbg.color.enhance as E
-import pwndbg.disasm
-import pwndbg.gdblib.arch
-import pwndbg.gdblib.config
-import pwndbg.gdblib.memory
-import pwndbg.gdblib.strings
-import pwndbg.gdblib.symbol
-import pwndbg.gdblib.typeinfo
+import pwndbg.color.memory
+import pwndbg.integration
 import pwndbg.lib.cache
 from pwndbg import color
-from pwndbg.color.syntax_highlight import syntax_highlight
-
-bad_instrs = [".byte", ".long", "rex.R", "rex.XB", ".inst", "(bad)"]
 
 
-def good_instr(i) -> bool:
-    return not any(bad in i for bad in bad_instrs)
+def format_small_int(value: int) -> str:
+    if value < 10:
+        return str(value)
+    else:
+        return hex(value)
+
+
+def format_small_int_pair(first: int, second: int) -> Tuple[str, str]:
+    if first < 10 and second < 10:
+        return (str(first), str(second))
+    else:
+        return (
+            hex(first),
+            hex(second),
+        )
 
 
 def int_str(value: int) -> str:
-    retval = "%#x" % int(value & pwndbg.gdblib.arch.ptrmask)
+    retval = format_small_int(value)
 
     # Try to unpack the value as a string
-    packed = pwndbg.gdblib.arch.pack(int(value))
+    packed = pwndbg.aglib.arch.pack(int(value))
     if all(c in string.printable.encode("utf-8") for c in packed):
         if len(retval) > 4:
             retval = "{} ({!r})".format(retval, str(packed.decode("ascii", "ignore")))
@@ -43,7 +56,13 @@ def int_str(value: int) -> str:
 
 
 # @pwndbg.lib.cache.cache_until("stop")
-def enhance(value: int, code: bool = True, safe_linking: bool = False) -> str:
+def enhance(
+    value: int,
+    code: bool = True,
+    safe_linking: bool = False,
+    attempt_dereference=True,
+    enhance_string_len: int = None,
+) -> str:
     """
     Given the last pointer in a chain, attempt to characterize
 
@@ -58,24 +77,28 @@ def enhance(value: int, code: bool = True, safe_linking: bool = False) -> str:
         value(obj): Value to enhance
         code(bool): Hint that indicates the value may be an instruction
         safe_linking(bool): Whether this chain use safe-linking
+        enhance_string_len(int): The length of string to display for enhancement of the last pointer
     """
     value = int(value)
 
-    name = pwndbg.gdblib.symbol.get(value) or None
-    page = pwndbg.gdblib.vmmap.find(value)
+    page = pwndbg.aglib.vmmap.find(value)
 
     # If it's not in a page we know about, try to dereference
     # it anyway just to test.
     can_read = True
-    if not page or None is pwndbg.gdblib.memory.peek(value):
+    if not attempt_dereference or not page or None is pwndbg.aglib.memory.peek(value):
         can_read = False
+
+    # If it's a pointer that we told we cannot deference, then color it accordingly and add symbol if can
+    if page and not attempt_dereference:
+        return pwndbg.color.memory.get_address_and_symbol(value)
 
     if not can_read:
         return E.integer(int_str(value))
 
     # It's mapped memory, or we can at least read it.
     # Try to find out if it's a string.
-    instr = None
+    instr: str | None = None
     exe = page and page.execute
     rwx = page and page.rwx
 
@@ -84,34 +107,34 @@ def enhance(value: int, code: bool = True, safe_linking: bool = False) -> str:
     if "[stack" in page.objfile or "[heap" in page.objfile:
         rwx = exe = False
 
-    # If IDA doesn't think it's in a function, don't display it as code.
-    if pwndbg.ida.available() and not pwndbg.ida.GetFunctionName(value):
+    # If integration doesn't think it's in a function, don't display it as code.
+    if not pwndbg.integration.provider.is_in_function(value):
         rwx = exe = False
 
     if exe:
-        instr = pwndbg.disasm.one(value)
-        if instr:
-            instr = f"{instr.mnemonic} {instr.op_str}"
-            if pwndbg.gdblib.config.syntax_highlight:
-                instr = syntax_highlight(instr)
+        pwndbg_instr = pwndbg.aglib.disasm.one(value)
+        if pwndbg_instr:
+            # For telescoping, we don't want the extra spaces between the mnemonic and operands
+            # which are baked in during enhancement. This removes those spaces.
+            instr = " ".join(pwndbg_instr.asm_string.split())
 
-    szval = pwndbg.gdblib.strings.get(value) or None
+    szval = pwndbg.aglib.strings.get(value, maxlen=enhance_string_len) or None
     szval0 = szval
     if szval:
         szval = E.string(repr(szval))
 
     # Fix for case when we can't read the end address anyway (#946)
-    if value + pwndbg.gdblib.arch.ptrsize > page.end:
+    if value + pwndbg.aglib.arch.ptrsize > page.end:
         return E.integer(int_str(value))
 
-    intval = int(pwndbg.gdblib.memory.poi(pwndbg.gdblib.typeinfo.pvoid, value))
+    intval = int(pwndbg.aglib.memory.get_typed_pointer_value(pwndbg.aglib.typeinfo.pvoid, value))
     if safe_linking:
         intval ^= value >> 12
     intval0 = intval
     if 0 <= intval < 10:
         intval = E.integer(str(intval))
     else:
-        intval = E.integer("%#x" % int(intval & pwndbg.gdblib.arch.ptrmask))
+        intval = E.integer("%#x" % int(intval & pwndbg.aglib.arch.ptrmask))
 
     retval = []
 
@@ -120,7 +143,7 @@ def enhance(value: int, code: bool = True, safe_linking: bool = False) -> str:
         instr = None
 
     # If it's on the stack, don't display it as code in a chain.
-    if instr and "stack" in page.objfile:
+    if instr and "[stack" in page.objfile:
         retval = [intval, szval]
 
     # If it's RWX but a small value, don't display it as code in a chain.
@@ -139,14 +162,19 @@ def enhance(value: int, code: bool = True, safe_linking: bool = False) -> str:
 
     # Otherwise strings have preference
     elif szval:
-        if len(szval0) < pwndbg.gdblib.arch.ptrsize:
+        if len(szval0) < pwndbg.aglib.arch.ptrsize:
             retval = [intval, szval]
         else:
             retval = [szval]
 
     # And then integer
     else:
-        return E.integer(int_str(intval0))
+        # It might be a pointer or just a plain integer
+        new_page = pwndbg.aglib.vmmap.find(intval0)
+        if new_page:
+            return pwndbg.color.memory.get_address_and_symbol(intval0)
+        else:
+            return E.integer(int_str(intval0))
 
     retval = tuple(filter(lambda x: x is not None, retval))
 
@@ -154,6 +182,6 @@ def enhance(value: int, code: bool = True, safe_linking: bool = False) -> str:
         return E.unknown("???")
 
     if len(retval) == 1:
-        return retval[0]
+        return retval[0]  # type: ignore[return-value]
 
-    return retval[0] + E.comment(color.strip(f" /* {'; '.join(retval[1:])} */"))
+    return retval[0] + E.comment(color.strip(f" /* {'; '.join(retval[1:])} */"))  # type: ignore[arg-type]

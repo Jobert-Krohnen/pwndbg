@@ -3,9 +3,9 @@ from __future__ import annotations
 import argparse
 from typing import NamedTuple
 
+import pwndbg.aglib.kernel
 import pwndbg.color.message as M
 import pwndbg.commands
-import pwndbg.gdblib.kernel
 from pwndbg.commands import CommandCategory
 
 
@@ -105,12 +105,11 @@ parser = argparse.ArgumentParser(description="Checks for kernel hardening config
 
 @pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.KERNEL)
 @pwndbg.commands.OnlyWhenQemuKernel
-@pwndbg.commands.OnlyWithKernelDebugSyms
 @pwndbg.commands.OnlyWhenPagingEnabled
 def kchecksec() -> None:
-    kconfig = pwndbg.gdblib.kernel.kconfig()
+    kconfig = pwndbg.aglib.kernel.kconfig()
 
-    if len(kconfig) == 0:
+    if not kconfig:
         print(
             M.warn(
                 "No kernel configuration found, make sure the kernel was built with CONFIG_IKCONFIG"
@@ -118,9 +117,7 @@ def kchecksec() -> None:
         )
         return
 
-    cmdline = pwndbg.gdblib.kernel.kcmdline()
-
-    options = _hardening_options + _arch_hardening_options.get(pwndbg.gdblib.arch.name, [])
+    options = _hardening_options + _arch_hardening_options.get(pwndbg.aglib.arch.name, [])
     for opt in options:
         config_name = opt.name
         val = kconfig.get(config_name)

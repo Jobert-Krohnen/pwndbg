@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import argparse
+from typing import Dict
+from typing import List
+from typing import Union
 
 from elftools.elf.elffile import ELFFile
 
+import pwndbg.aglib.arch
+import pwndbg.aglib.file
+import pwndbg.aglib.proc
+import pwndbg.aglib.qemu
+import pwndbg.aglib.vmmap
 import pwndbg.chain
 import pwndbg.color.memory as M
 import pwndbg.commands
 import pwndbg.enhance
-import pwndbg.gdblib.arch
-import pwndbg.gdblib.file
 import pwndbg.gdblib.info
-import pwndbg.gdblib.proc
-import pwndbg.gdblib.qemu
-import pwndbg.gdblib.vmmap
 import pwndbg.wrappers.checksec
 import pwndbg.wrappers.readelf
 from pwndbg.color import message
@@ -63,8 +66,8 @@ parser.add_argument(
 
 @pwndbg.commands.ArgparsedCommand(parser, category=CommandCategory.LINUX)
 @pwndbg.commands.OnlyWhenRunning
-def got(path_filter, all_, accept_readonly, symbol_filter) -> None:
-    if pwndbg.gdblib.qemu.is_qemu_usermode():
+def got(path_filter: str, all_: bool, accept_readonly: bool, symbol_filter: str) -> None:
+    if pwndbg.aglib.qemu.is_qemu_usermode():
         print(
             "QEMU target detected - the result might not be accurate when checking if the entry is writable and getting the information for libraries/objfiles"
         )
@@ -83,7 +86,7 @@ def got(path_filter, all_, accept_readonly, symbol_filter) -> None:
     # Calculate the base address
     if not path_filter:
         first_print = False
-        _got(pwndbg.gdblib.proc.exe, accept_readonly, symbol_filter)
+        _got(pwndbg.aglib.proc.exe, accept_readonly, symbol_filter)
     else:
         first_print = True
 
@@ -108,9 +111,9 @@ def got(path_filter, all_, accept_readonly, symbol_filter) -> None:
                 print("    " + path)
 
 
-def _got(path, accept_readonly, symbol_filter) -> None:
+def _got(path: str, accept_readonly: bool, symbol_filter: str) -> None:
     # Maybe download the file from remote
-    local_path = pwndbg.gdblib.file.get_file(path, try_local_path=True)
+    local_path = pwndbg.aglib.file.get_file(path, try_local_path=True)
 
     relro_status = pwndbg.wrappers.checksec.relro_status(local_path)
     pie_status = pwndbg.wrappers.checksec.pie_status(local_path)
@@ -118,9 +121,9 @@ def _got(path, accept_readonly, symbol_filter) -> None:
 
     # The following code is inspired by the "got" command of https://github.com/bata24/gef/blob/dev/gef.py by @bata24, thank you!
     # TODO/FIXME: Maybe a -v option to show more information will be better
-    outputs = []
-    if path == pwndbg.gdblib.proc.exe:
-        bin_base_offset = pwndbg.gdblib.proc.binary_base_addr if "PIE enabled" in pie_status else 0
+    outputs: List[Dict[str, Union[str, int]]] = []
+    if path == pwndbg.aglib.proc.exe:
+        bin_base_offset = pwndbg.aglib.proc.binary_base_addr if "PIE enabled" in pie_status else 0
     else:
         # TODO/FIXME: Is there a better way to get the base address of the loaded shared library?
         # I guess parsing the vmmap result might also work, but what if it's not reliable or not available? (e.g. debugging with qemu-user)
@@ -133,24 +136,32 @@ def _got(path, accept_readonly, symbol_filter) -> None:
     # Parse the output of readelf line by line
     for category, lines in got_entry.items():
         for line in lines:
-            # line might be something like:
-            # 00000000001ec018  0000000000000025 R_X86_64_IRELATIVE                        a0480
-            # or something like:
-            # 00000000001ec030  0000020a00000007 R_X86_64_JUMP_SLOT     000000000009ae80 realloc@@GLIBC_2.2.5 + 0
-            offset, _, rtype, *rest = line.split()[:5]
-            if len(rest) == 1:
-                value = rest[0]
+            # There are 5 fields in the output of readelf:
+            # "Offset", "Info", "Type", "Sym. Value", and "Symbol's Name"
+            # We only care about "Offset", "Sym. Value" and "Symbol's Name" here
+            offset, _, _, *rest = line.split()[:5]
+            if len(rest) < 2:
+                # "Sym. Value" or "Symbol's Name" are not present in this case
+                # The output of readelf might look like this (missing both value and name):
+                # 00004e88  00000008 R_386_RELATIVE
+                # or something like this (only missing name):
+                # 00000000001ec018  0000000000000025 R_X86_64_IRELATIVE                        a0480
+                # TODO: Is it possible that we are missing the value but not the name?
+                value = rest[0] if rest else ""
                 name = ""
             else:
+                # Every fields are present in this case
+                # The output of readelf might look like this:
+                # 00000000001ec030  0000020a00000007 R_X86_64_JUMP_SLOT     000000000009ae80 realloc@@GLIBC_2.2.5 + 0
                 value, name = rest
             address = int(offset, 16) + bin_base_offset
             # TODO/FIXME: This check might not work correctly if we failed to get the correct vmmap result
-            if not accept_readonly and not pwndbg.gdblib.vmmap.find(address).write:
+            if not accept_readonly and not pwndbg.aglib.vmmap.find(address).write:
                 continue
             if not name and category == RelocationType.IRELATIVE:
                 # TODO/FIXME: I don't know the naming logic behind this yet, I'm just modifying @bata24's code here :p
                 # We might need to add some comments here to explain the logic in the future, and also fix it if something wrong
-                if pwndbg.gdblib.arch.name == "i386":
+                if pwndbg.aglib.arch.name == "i386":
                     name = "*ABS*"
                 else:
                     name = f"*ABS*+0x{int(value, 16):x}"
@@ -175,5 +186,5 @@ def _got(path, accept_readonly, symbol_filter) -> None:
     )
     for output in outputs:
         print(
-            f"[{M.get(output['address'])}] {message.hint(output['name'])} -> {pwndbg.chain.format(pwndbg.gdblib.memory.pvoid(output['address']))}"
+            f"[{M.get(output['address'])}] {message.hint(output['name'])} -> {pwndbg.chain.format(pwndbg.aglib.memory.pvoid(output['address']))}"  # type: ignore[arg-type]
         )

@@ -3,7 +3,8 @@ from __future__ import annotations
 import gdb
 import pytest
 
-import pwndbg.gdblib.config
+import pwndbg.dbg
+import pwndbg.lib.config
 
 
 @pytest.mark.parametrize(
@@ -13,14 +14,17 @@ import pwndbg.gdblib.config
         ("bool", True, "on", {}),
         ("bool", False, "off", {}),
         ("string", "some-string-val", "some-string-val", {}),
-        ("auto-bool", None, "auto", {"param_class": gdb.PARAM_AUTO_BOOLEAN}),
-        ("unlimited-uint", 0, "unlimited", {"param_class": gdb.PARAM_UINTEGER}),
-        ("unlimited-int", 0, "unlimited", {"param_class": gdb.PARAM_INTEGER}),
+        ("auto-bool", None, "auto", {"param_class": pwndbg.lib.config.PARAM_AUTO_BOOLEAN}),
+        ("unlimited-uint", 0, "unlimited", {"param_class": pwndbg.lib.config.PARAM_UINTEGER}),
+        ("unlimited-int", 0, "unlimited", {"param_class": pwndbg.lib.config.PARAM_INTEGER}),
         (
             "enum",
             "enum1",
             "enum1",
-            {"param_class": gdb.PARAM_ENUM, "enum_sequence": ["enum1", "enum2", "enum3"]},
+            {
+                "param_class": pwndbg.lib.config.PARAM_ENUM,
+                "enum_sequence": ["enum1", "enum2", "enum3"],
+            },
         ),
         # Note: GDB < 9 does not support PARAM_ZUINTEGER*, so we implement it by ourselves for consistency
         (
@@ -28,9 +32,11 @@ import pwndbg.gdblib.config
             0,
             "0",
             {
-                "param_class": gdb.PARAM_ZUINTEGER
-                if hasattr(gdb, "PARAM_ZUINTEGER")
-                else "PARAM_ZUINTEGER"
+                "param_class": (
+                    pwndbg.lib.config.PARAM_ZUINTEGER
+                    if hasattr(gdb, "PARAM_ZUINTEGER")
+                    else "PARAM_ZUINTEGER"
+                )
             },
         ),
         (
@@ -38,9 +44,11 @@ import pwndbg.gdblib.config
             -1,
             "unlimited",
             {
-                "param_class": gdb.PARAM_ZUINTEGER_UNLIMITED
-                if hasattr(gdb, "PARAM_ZUINTEGER_UNLIMITED")
-                else "PARAM_ZUINTEGER_UNLIMITED"
+                "param_class": (
+                    pwndbg.lib.config.PARAM_ZUINTEGER_UNLIMITED
+                    if hasattr(gdb, "PARAM_ZUINTEGER_UNLIMITED")
+                    else "PARAM_ZUINTEGER_UNLIMITED"
+                )
             },
         ),
     ),
@@ -56,7 +64,7 @@ def test_gdb_parameter_default_value_works(start_binary, params):
 
     set_show_doc = "the value of the foo"
 
-    param = pwndbg.gdblib.config.add_param(
+    param = pwndbg.config.add_param(
         param_name,
         default_value,
         set_show_doc,
@@ -65,7 +73,10 @@ def test_gdb_parameter_default_value_works(start_binary, params):
     )
 
     # Initialize and register param in GDB as if it would be done by gdblib.config.init_params
-    pwndbg.gdblib.config_mod.Parameter(param)
+    if pwndbg.dbg.is_gdblib_available():
+        from pwndbg.gdblib import config_mod as gdblib_config_mod
+
+        gdblib_config_mod.Parameter(param)
 
     out = gdb.execute(f"show {param_name}", to_string=True)
     assert (
@@ -73,7 +84,8 @@ def test_gdb_parameter_default_value_works(start_binary, params):
         == f"{set_show_doc.capitalize()} is {displayed_value!r}. See `help set {param_name}` for more information.\n"
     )
     if (
-        optional_kwargs.get("param_class") in (gdb.PARAM_UINTEGER, gdb.PARAM_INTEGER)
+        optional_kwargs.get("param_class")
+        in (pwndbg.lib.config.PARAM_UINTEGER, pwndbg.lib.config.PARAM_INTEGER)
         and default_value == 0
     ):
         # Note: This is really weird, according to GDB docs, 0 should mean "unlimited" for gdb.PARAM_UINTEGER and gdb.PARAM_INTEGER, but somehow GDB sets the value to `None` actually :/
